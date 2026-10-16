@@ -563,6 +563,12 @@ def _apply_sampling_stop(sampling_params: dict[str, Any], stop: Any) -> None:
     raise TypeError("Sampling stop sequences must contain only strings or only token ids")
 
 
+def _scalar_prompt_logprobs(raw: list, prompt_len: int) -> list[float | None]:
+    """``prompt_logprobs=0`` rows -> Tinker shape: leading None, then one value per scored position."""
+    scored = [(pos[0] if isinstance(pos, list) and pos else None) for pos in raw]
+    return [None] + scored[: max(0, prompt_len - 1)]
+
+
 async def sample(engine, req) -> dict:
     prompt_ids = list(req.prompt.to_ints())
     num_samples = int(req.num_samples)
@@ -630,8 +636,18 @@ async def sample(engine, req) -> dict:
             formatted = _format_topk_prompt_logprobs(prompt_ids_raw, prompt_lp_raw) or []
             topk_prompt_logprobs_out = [[]] + formatted[: max(0, len(prompt_ids) - 1)]
         else:
-            scored = [(pos[0] if isinstance(pos, list) and pos else None) for pos in prompt_lp_raw]
-            prompt_logprobs_out = [None] + scored[: max(0, len(prompt_ids) - 1)]
+            prompt_logprobs_out = _scalar_prompt_logprobs(prompt_lp_raw, len(prompt_ids))
+    if req.prompt_logprobs and req.topk_prompt_logprobs:
+        # Tinker returns both fields when both are requested. The top-k rows need
+        # not contain the actual prompt token, so score it in one scalar pass.
+        scalar_params = {k: v for k, v in sampling_params.items() if k not in {"stop", "stop_token_ids"}}
+        scalar_params.update(max_tokens=1, prompt_logprobs=0)
+        scalar = await engine.generate(
+            request_id=uuid.uuid4().hex, prompt_ids=prompt_ids, sampling_params=scalar_params
+        )
+        scalar_raw = (getattr(scalar, "extra_fields", None) or {}).get("prompt_logprobs")
+        if scalar_raw is not None:
+            prompt_logprobs_out = _scalar_prompt_logprobs(scalar_raw, len(prompt_ids))
 
     return {
         "type": "sample",

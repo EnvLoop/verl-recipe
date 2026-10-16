@@ -217,6 +217,34 @@ async def test_sample_formats_topk_prompt_logprobs_for_current_tinker_schema():
 
 
 @pytest.mark.asyncio
+async def test_sample_returns_scalar_and_topk_prompt_logprobs_together():
+    req = SimpleNamespace(
+        prompt=_Prompt(),
+        sampling_params=SimpleNamespace(max_tokens=4, temperature=0.7, top_p=0.9, top_k=20, stop=None, seed=None),
+        num_samples=1,
+        prompt_logprobs=True,
+        topk_prompt_logprobs=2,
+    )
+
+    class RecordingEngine(_Engine):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        async def generate(self, request_id, prompt_ids, sampling_params):
+            self.calls.append(dict(sampling_params))
+            return await super().generate(request_id, prompt_ids, sampling_params)
+
+    engine = RecordingEngine()
+    result = await sample(engine, req)
+
+    assert result["topk_prompt_logprobs"] == [[], [(11, -1.1), (12, -2.2)], [(13, -3.3)]]
+    assert result["prompt_logprobs"] == [None, -1.1, -3.3]
+    assert [call["prompt_logprobs"] for call in engine.calls] == [2, 0]
+    assert engine.calls[1]["max_tokens"] == 1
+
+
+@pytest.mark.asyncio
 async def test_sample_fans_out_multiple_sequences_and_offsets_seed():
     req = SimpleNamespace(
         prompt=_Prompt(),
