@@ -253,9 +253,11 @@ the corresponding GPU memory and inference capacity.
 
 ### Server-configured custom loss
 
-The five Tinker-native wire losses are `cross_entropy`,
-`importance_sampling`, `ppo`, `cispo`, and `dro`. Verl-tinker additionally
-accepts `custom_from_config` on `forward_backward`:
+The Tinker-native wire losses are `cross_entropy`, `importance_sampling`,
+`ppo`, `cispo`, `dro`, and `gspo`, implemented with the formulas, defaults
+(ppo 0.8/1.2, cispo 0.0/4.0, gspo 1-3e-4/1+4e-4, dro `beta`) and
+`loss_fn_inputs` contract of the Tinker loss docs (see `ENVLOOP_CHANGES.md`).
+Verl-tinker additionally accepts `custom_from_config` on `forward_backward`:
 
 ```python
 future = training_client.forward_backward(
@@ -272,9 +274,9 @@ preserves the string.
 
 This is separate from Tinker's `forward_backward_custom`, which evaluates a
 Python loss function in the client and sends `cross_entropy` forward/backward
-requests to the server. Verl-tinker currently supports that SDK helper only
-for 1-D `target_tokens`; multi-target custom losses are rejected before engine
-execution.
+requests (float weights of either sign) to the server. Verl-tinker currently
+supports that SDK helper only for 1-D `target_tokens`; multi-target custom
+losses are rejected by `/api/v1/forward` before engine execution.
 
 
 ## Run the included client examples
@@ -380,7 +382,9 @@ when loading, interpolation, processing, or validation fails.
 - LoRA is configured server-side through VeRL's
   `actor_rollout_ref.model.lora` / `lora_rank` / `lora_adapter_path` settings;
   a client's `CreateModelRequest.lora_config` does not reconfigure the running
-  engine. With LoRA enabled, scalar prompt-logprob sampling for the initial
+  engine. `get_info` / `weights_info` report the configured rank, alpha and
+  train_attn/train_mlp/train_unembed, and a `create_model` asking for a
+  different rank is rejected with HTTP 409. With LoRA enabled, scalar prompt-logprob sampling for the initial
   model evaluates the frozen base weights with the adapter disabled. It does
   not enable autoregressive base-model sampling after rollout weights diverge.
 

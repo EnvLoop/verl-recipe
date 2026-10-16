@@ -902,3 +902,129 @@ class TestNoRolloutDeployment:
         worker.actor.optimizer_zero_grad.assert_not_called()
         worker.actor.to.assert_called_once_with(device="cpu", model=False, optimizer=True, grad=False)
         mock_empty_cache.assert_called_once_with(force_sync=True)
+
+
+# ==================== EnvLoop: per-step grad_clip_norm ====================
+
+
+class _CpuFsdpLikeEngine:
+    """Just enough of VeRL's FSDPEngine to run its real ``optimizer_step`` on CPU."""
+
+    def __init__(self, clip_grad=1.0, lr=0.1):
+        from verl.workers.config.optimizer import FSDPOptimizerConfig
+
+        torch.manual_seed(0)
+        self.module = torch.nn.Linear(4, 3)
+        self.optimizer = torch.optim.SGD(self.module.parameters(), lr=lr)
+        self.optimizer_config = FSDPOptimizerConfig(lr=lr, clip_grad=clip_grad)
+        self._qat_enabled = False
+
+    def set_grads(self, scale):
+        for param in self.module.parameters():
+            param.grad = torch.full_like(param, scale)
+
+    def grad_norm(self):
+        return torch.sqrt(sum((p.grad**2).sum() for p in self.module.parameters())).item()
+
+    def params(self):
+        return [p.detach().clone() for p in self.module.parameters()]
+
+    def train_mode(self, zero_grad_on_exit=False, **kwargs):
+        engine = self
+
+        class _Ctx:
+            def __enter__(self):
+                return engine
+
+            def __exit__(self, *exc):
+                if zero_grad_on_exit:
+                    engine.optimizer.zero_grad()
+
+        return _Ctx()
+
+    def optimizer_step(self):
+        from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
+
+        return FSDPEngine.optimizer_step(self)
+
+    def is_mp_src_rank_with_outputs(self):
+        return True
+
+
+def _grad_clip_worker(engine):
+    from verl.workers.engine_workers_tinker import TinkerTrainingWorker
+
+    actor = object.__new__(TinkerTrainingWorker)
+    actor.engine = engine
+    worker = object.__new__(TinkerServerActorRolloutRefWorker)
+    worker.role = "actor"
+    worker.actor = actor
+    return worker
+
+
+@pytest.mark.parametrize(
+    ("grad_clip_norm", "expected"),
+    [(None, None), (0.0, float("inf")), (-1.0, float("inf")), (0.5, 0.5), (3, 3.0)],
+)
+def test_effective_clip_grad_maps_tinker_semantics(grad_clip_norm, expected):
+    from verl_tinker.backends.colocated import effective_clip_grad
+
+    assert effective_clip_grad(grad_clip_norm) == expected
+
+
+@pytest.mark.parametrize(
+    ("grad_clip_norm", "server_clip_grad", "expected_norm_after_clip"),
+    [
+        (0.5, 1.0, 0.5),  # Tinker clip below the server default
+        (10.0, 1.0, None),  # threshold above the norm: untouched
+        (0.0, 1.0, None),  # Tinker default 0.0: no clipping although the server config would clip at 1.0
+        (None, 1.0, 1.0),  # no AdamParams sent: server-start clip_grad applies
+    ],
+)
+def test_optimizer_step_with_grad_clip_clips_global_norm_and_reports_pre_clip_norm(
+    grad_clip_norm, server_clip_grad, expected_norm_after_clip
+):
+    engine = _CpuFsdpLikeEngine(clip_grad=server_clip_grad, lr=0.1)
+    engine.set_grads(1.0)  # global norm = sqrt(15) ~ 3.87
+    pre_clip = engine.grad_norm()
+    before = engine.params()
+    worker = _grad_clip_worker(engine)
+
+    metrics = worker.optimizer_step_with_grad_clip(optim_step_params=None, grad_clip_norm=grad_clip_norm)
+
+    assert metrics["grad_norm"] == pytest.approx(pre_clip)
+    applied_scale = 1.0 if expected_norm_after_clip is None else expected_norm_after_clip / pre_clip
+    for old, new in zip(before, engine.params(), strict=True):
+        torch.testing.assert_close(old - new, torch.full_like(old, 0.1 * applied_scale), rtol=1e-4, atol=1e-6)
+    # The per-step override never leaks into later steps.
+    assert engine.optimizer_config.clip_grad == server_clip_grad
+    # zero_grad_on_exit: gradients are consumed by the step.
+    assert all(p.grad is None or torch.count_nonzero(p.grad) == 0 for p in engine.module.parameters())
+
+
+def test_optimizer_step_with_grad_clip_restores_config_on_failure():
+    engine = _CpuFsdpLikeEngine(clip_grad=1.0)
+    engine.set_grads(1.0)
+    worker = _grad_clip_worker(engine)
+    engine.optimizer_step = MagicMock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        worker.optimizer_step_with_grad_clip(grad_clip_norm=0.25)
+
+    assert engine.optimizer_config.clip_grad == 1.0
+
+
+def test_backend_optim_step_routes_grad_clip_norm_to_worker_override():
+    backend = _make_backend(_make_config())
+    backend.actor_rollout_wg.optimizer_step_with_grad_clip.return_value = [{"grad_norm": 2.0}]
+
+    result = backend.optim_step({"lr": 1e-5}, grad_clip_norm=0.0)
+
+    assert result == [{"grad_norm": 2.0}]
+    backend.actor_rollout_wg.optimizer_step_with_grad_clip.assert_called_once_with(
+        optim_step_params={"lr": 1e-5}, grad_clip_norm=0.0
+    )
+    backend.actor_rollout_wg.optimizer_step.assert_not_called()
+
+    backend.optim_step({"lr": 1e-5})
+    backend.actor_rollout_wg.optimizer_step.assert_called_once_with(optim_step_params={"lr": 1e-5})
