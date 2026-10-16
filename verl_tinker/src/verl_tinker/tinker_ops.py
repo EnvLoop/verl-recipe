@@ -17,9 +17,7 @@
 import asyncio
 import json
 import logging
-import math
 import uuid
-import warnings
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, get_args
@@ -35,6 +33,14 @@ from .data.datum_processing import (
     _datums_to_update_actor_td,
 )
 from .schemas import TinkerLossFnType
+from .tinker_losses import (
+    CROSS_ENTROPY,
+    LossContractError,
+    finalize_gspo_metrics,
+    loss_metrics_from_logprobs,
+    normalize_loss_spec,
+    validate_loss_fn_inputs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,56 +49,42 @@ GLOBAL_MODEL_ID = "verl-remote-actor-model"
 STATE_METADATA_FILE = "metadata.json"
 
 
-def normalize_tinker_loss_spec(loss_name: str, loss_config: dict[str, float] | None = None) -> dict:
+def normalize_tinker_loss_spec(loss_name: str, loss_config: dict[str, Any] | None = None) -> dict:
     """Validate the wire loss request before constructing a verl TensorDict.
 
+    See ``tinker_losses.normalize_loss_spec`` for the Tinker defaults
+    (ppo 0.8/1.2, cispo 0.0/4.0, gspo 1-3e-4/1+4e-4, dro ``beta``).
     ``custom_from_config`` is a verl-tinker extension: the wire config is
     intentionally ignored and the actor config supplied at server startup is
     used by the engine unchanged.
     """
     supported_losses = get_args(TinkerLossFnType)
     if loss_name not in supported_losses:
-        raise ValueError(f"Unsupported loss {loss_name!r}; expected one of {sorted(supported_losses)}")
+        raise LossContractError(f"Unsupported loss {loss_name!r}; expected one of {sorted(supported_losses)}")
+    return normalize_loss_spec(loss_name, loss_config)
 
-    if loss_name == "custom_from_config":
-        return {"name": loss_name}
 
-    config = dict(loss_config or {})
-    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in config.values()):
-        raise ValueError("loss_fn_config values must be finite numbers")
-    if any(not math.isfinite(float(value)) for value in config.values()):
-        raise ValueError("loss_fn_config values must be finite numbers")
+def validate_tinker_loss_request(
+    loss_name: str,
+    loss_config: dict[str, Any] | None,
+    datums,
+    *,
+    forward_only: bool = False,
+) -> dict:
+    """Full synchronous validation of a forward / forward_backward request.
 
-    if loss_name in {"cross_entropy", "importance_sampling"}:
-        if config:
-            raise ValueError(f"loss_fn={loss_name!r} does not accept loss_fn_config; got {sorted(config)}")
-        return {"name": loss_name}
+    Returns the normalized loss spec; raises ``LossContractError`` (a
+    ``ValueError``) with a client-facing message on any contract violation.
+    """
+    spec = normalize_tinker_loss_spec(loss_name, loss_config)
+    validate_loss_fn_inputs(loss_name, datums, forward_only=forward_only)
+    return spec
 
-    if loss_name in {"ppo", "cispo"}:
-        allowed = {"clip_low_threshold", "clip_high_threshold"}
-        unknown = sorted(set(config) - allowed)
-        if unknown:
-            raise ValueError(f"loss_fn={loss_name!r} received unsupported config fields: {unknown}")
-        default_low, default_high = (0.8, 1.2) if loss_name == "ppo" else (0.0, 4.0)
-        low = float(config.get("clip_low_threshold", default_low))
-        high = float(config.get("clip_high_threshold", default_high))
-        if not 0.0 <= low <= 1.0 <= high:
-            raise ValueError(
-                f"loss_fn={loss_name!r} requires 0 <= clip_low_threshold <= 1 <= "
-                f"clip_high_threshold; got low={low}, high={high}"
-            )
-        return {
-            "name": loss_name,
-            "clip_ratio_low": 1.0 - low,
-            "clip_ratio_high": high - 1.0,
-        }
 
-    unknown = sorted(set(config) - {"beta"})
-    if unknown:
-        raise ValueError(f"loss_fn='dro' received unsupported config fields: {unknown}")
-    if "beta" not in config or float(config["beta"]) <= 0:
-        raise ValueError("loss_fn='dro' requires a positive loss_fn_config['beta']")
-    return {"name": "dro", "dro_beta": float(config["beta"])}
+def _http_422(exc: Exception):
+    from fastapi import HTTPException
+
+    return HTTPException(status_code=422, detail=str(exc))
 
 
 def get_configured_model_name(engine) -> str:
@@ -157,6 +149,117 @@ def _format_topk_prompt_logprobs(
     return out
 
 
+def _topk_rows_or_none(rows: list[list[tuple[int, float]]]) -> list[list[tuple[int, float]] | None]:
+    """SDK shape: a position with no reported candidates is ``None``."""
+    return [row if row else None for row in rows]
+
+
+def _configured_max_model_len(engine) -> int | None:
+    try:
+        from omegaconf import OmegaConf
+
+        value = OmegaConf.select(engine.config, "actor_rollout_ref.rollout.max_model_len")
+    except Exception:
+        return None
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _sampled_topk_logprobs(
+    engine,
+    prompt_ids: list[int],
+    tokens: list[int],
+    k: int,
+    base_params: dict[str, Any],
+) -> list[list[tuple[int, float]] | None]:
+    """Top-k logprobs at every sampled position (``SampledSequence.topk_logprobs``).
+
+    VeRL's vLLM server forces ``SamplingParams.logprobs`` to 0 (sampled token
+    only), so the top-k candidates are recovered with a teacher-forced
+    prompt-logprob pass over ``prompt + completion`` on the same rollout
+    weights: vLLM's ``prompt_logprobs=k`` at position ``len(prompt) + t`` is the
+    distribution that produced sampled token ``t``. Costs one extra prefill per
+    sequence and is only run when ``topk_sample_logprobs > 0``.
+    """
+    if not tokens:
+        return []
+    if not prompt_ids:
+        return [None] * len(tokens)
+
+    params = {
+        "max_tokens": 1,
+        "temperature": base_params.get("temperature", 1.0),
+        "top_p": base_params.get("top_p", 1.0),
+        "top_k": base_params.get("top_k", -1),
+        "n": 1,
+        "prompt_logprobs": int(k),
+    }
+
+    async def _score(scored_tokens: list[int]):
+        return await engine.generate(
+            request_id=uuid.uuid4().hex,
+            prompt_ids=list(prompt_ids) + list(scored_tokens),
+            sampling_params=dict(params),
+        )
+
+    # The scoring request needs one token of generation headroom. When the
+    # completion filled the context window, drop the last sampled token and
+    # report ``None`` for its position.
+    scored = list(tokens)
+    max_model_len = _configured_max_model_len(engine)
+    if max_model_len is not None and len(prompt_ids) + len(scored) >= max_model_len:
+        scored = scored[:-1]
+    try:
+        result = await _score(scored)
+    except Exception as exc:
+        # VeRL's vLLM server: "Prompt length (...) leaves no room to generate
+        # within the model's maximum context length" (max_model_len unknown here).
+        no_headroom = "no room" in str(exc) or "context length" in str(exc)
+        if not no_headroom or len(scored) != len(tokens) or not scored:
+            raise
+        scored = scored[:-1]
+        result = await _score(scored)
+
+    extras = getattr(result, "extra_fields", None) or {}
+    rows = _format_topk_prompt_logprobs(extras.get("prompt_ids"), extras.get("prompt_logprobs")) or []
+    # rows[i] scores prompt position i + 1; sampled token t sits at len(prompt) + t.
+    start = len(prompt_ids) - 1
+    selected = rows[start : start + len(scored)]
+    selected = selected + [[]] * (len(tokens) - len(selected))
+    return _topk_rows_or_none(selected)
+
+
+def _sampling_is_unmodified(sampling_params: dict[str, Any]) -> bool:
+    """True when the sampling distribution is the model's own (T=1, no top-p / top-k truncation)."""
+    return (
+        float(sampling_params.get("temperature", 1.0)) == 1.0
+        and float(sampling_params.get("top_p", 1.0)) >= 1.0
+        and int(sampling_params.get("top_k", -1)) <= 0
+    )
+
+
+def _pin_sampled_entries(rows, tokens, logprobs):
+    """Make each sampled token's top-k entry carry exactly its sampled logprob.
+
+    On Tinker both come from the same forward pass, so they are equal. Here the
+    top-k rows come from a separate scoring pass on the same weights and differ
+    by kernel/batching noise; the sampled-token entry is set to the sampling
+    pass value (which is what RL uses as ``q``) and the row is re-sorted.
+    """
+    if logprobs is None:
+        return rows
+    pinned = []
+    for token, logprob, row in zip(tokens, logprobs, rows, strict=True):
+        if row is None or logprob is None:
+            pinned.append(row)
+            continue
+        row = [(tid, float(logprob)) if tid == token else (tid, lp) for tid, lp in row]
+        pinned.append(sorted(row, key=lambda entry: entry[1], reverse=True))
+    return pinned
+
+
 def _normalize_tinker_stop_reason(stop_reason: Any) -> str:
     """Map rollout backend stop reasons to Tinker's public StopReason literals."""
     if stop_reason in (None, "stop", "completed"):
@@ -191,14 +294,6 @@ def _adam_params_to_optim_step_params(adam_params) -> OptimStepParams | None:
     if adam_params is None:
         return None
 
-    grad_clip_norm = getattr(adam_params, "grad_clip_norm", None)
-    if grad_clip_norm is not None:
-        warnings.warn(
-            "grad_clip_norm is accepted for Tinker API compatibility but is not used by verl-recipes.",
-            UserWarning,
-            stacklevel=2,
-        )
-
     return OptimStepParams(
         lr=adam_params.learning_rate,
         eps=adam_params.eps,
@@ -207,17 +302,47 @@ def _adam_params_to_optim_step_params(adam_params) -> OptimStepParams | None:
     )
 
 
-async def forward(engine, datums) -> dict:
+def _grad_clip_norm_from_adam_params(adam_params) -> float | None:
+    """Tinker ``AdamParams.grad_clip_norm``: > 0 clips, 0 / negative / None disables.
+
+    Returns ``None`` only when no optimizer params were sent at all, in which
+    case the engine keeps the server-start ``actor.optim.clip_grad``.
+    """
+    if adam_params is None:
+        return None
+    value = getattr(adam_params, "grad_clip_norm", None)
+    return 0.0 if value is None else float(value)
+
+
+def _per_sample_logprobs(log_probs) -> list:
+    if log_probs.is_nested:
+        return list(log_probs.unbind())
+    return [log_probs[i] for i in range(log_probs.shape[0])]
+
+
+async def forward(engine, datums, loss_fn: str | None = None, loss_fn_config: dict[str, Any] | None = None) -> dict:
+    """Tinker ``forward``: target logprobs (+ loss diagnostics), no gradients.
+
+    Runs VeRL's ``compute_log_prob`` (``infer_batch``: ``torch.no_grad``, eval
+    mode, no backward, no ``zero_grad``), so gradients accumulated by earlier
+    ``forward_backward`` calls are left untouched for the next ``optim_step``.
+    When ``loss_fn`` is given, the request is validated like
+    ``forward_backward`` and ``loss:sum`` (plus loss-specific diagnostics) is
+    evaluated with the Tinker formulas from the returned logprobs.
+    """
+    spec = None
+    if loss_fn is not None:
+        try:
+            spec = validate_tinker_loss_request(loss_fn, loss_fn_config, datums, forward_only=True)
+        except LossContractError as exc:
+            raise _http_422(exc) from exc
+
     td = _datums_to_forward_td(datums, pad_to_multiple=engine.world_size)
     result_td = await asyncio.to_thread(engine.compute_log_prob, td)
 
     outputs = []
-    log_probs = result_td.get("log_probs")
-    if log_probs.is_nested:
-        per_sample = list(log_probs.unbind())
-    else:
-        per_sample = [log_probs[i] for i in range(log_probs.shape[0])]
-    per_sample = per_sample[: len(datums)]
+    target_logprobs = []
+    per_sample = _per_sample_logprobs(result_td.get("log_probs"))[: len(datums)]
     if len(per_sample) != len(datums):
         raise RuntimeError(f"compute_log_prob returned {len(per_sample)} samples but request carried {len(datums)}.")
 
@@ -229,29 +354,34 @@ async def forward(engine, datums) -> dict:
                 f"compute_log_prob returned {lp.numel()} log-probs for valid_len={expected_valid_len}; "
                 "expected full input length so trailing wrap-around drop matches Tinker's target_len contract."
             )
+        target_logprobs.append(lp[:-1])
         lp_list = lp[:-1].tolist()
         outputs.append({"logprobs": {"data": lp_list, "dtype": "float32", "shape": [len(lp_list)]}})
 
+    metrics = loss_metrics_from_logprobs(spec, datums, target_logprobs) if spec is not None else {}
     return {
         "type": "forward_backward",
-        "loss_fn_output_type": "log_probs",
+        "loss_fn_output_type": loss_fn or "log_probs",
         "loss_fn_outputs": outputs,
-        "metrics": {},
+        "metrics": metrics,
     }
 
 
-async def forward_backward(engine, datums, loss_fn_name: str, loss_fn_config: dict[str, float] | None = None) -> dict:
+async def forward_backward(engine, datums, loss_fn_name: str, loss_fn_config: dict[str, Any] | None = None) -> dict:
     try:
-        loss_spec = normalize_tinker_loss_spec(loss_fn_name, loss_fn_config)
-    except ValueError as exc:
-        from fastapi import HTTPException
+        loss_spec = validate_tinker_loss_request(loss_fn_name, loss_fn_config, datums)
+    except LossContractError as exc:
+        raise _http_422(exc) from exc
 
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    if loss_fn_name == "cross_entropy":
+    if loss_fn_name == CROSS_ENTROPY:
         td = _datums_to_sft_td(datums, mini_batch_size=len(datums), pad_to_multiple=engine.world_size)
     else:
-        td = _datums_to_update_actor_td(datums, mini_batch_size=len(datums), pad_to_multiple=engine.world_size)
+        td = _datums_to_update_actor_td(
+            datums,
+            mini_batch_size=len(datums),
+            pad_to_multiple=engine.world_size,
+            loss_name=loss_fn_name,
+        )
 
     from verl.utils import tensordict_utils as tu
 
@@ -260,7 +390,7 @@ async def forward_backward(engine, datums, loss_fn_name: str, loss_fn_config: di
     result_td = await asyncio.to_thread(engine.forward_backward, td)
 
     raw_metrics = tu.get(result_td, "metrics", {}) if result_td is not None else {}
-    metrics = _coerce_verl_metrics_to_floats(raw_metrics or {})
+    metrics = finalize_gspo_metrics(_coerce_verl_metrics_to_floats(raw_metrics or {}))
     if "loss:sum" not in metrics:
         for candidate in ("actor/pg_loss:sum", "distillation/loss:sum"):
             if candidate in metrics:
@@ -277,10 +407,7 @@ async def forward_backward(engine, datums, loss_fn_name: str, loss_fn_config: di
     if result_td is not None:
         log_probs = result_td.get("log_probs", None)
         if log_probs is not None:
-            if log_probs.is_nested:
-                logprobs_per_sample = list(log_probs.unbind())
-            else:
-                logprobs_per_sample = [log_probs[i] for i in range(log_probs.shape[0])]
+            logprobs_per_sample = _per_sample_logprobs(log_probs)
 
     outputs = []
     for i, datum in enumerate(datums):
@@ -310,11 +437,25 @@ async def forward_backward(engine, datums, loss_fn_name: str, loss_fn_config: di
 
 
 async def optim_step(engine, adam_params=None) -> dict:
+    """Apply one optimizer step with Tinker ``AdamParams`` semantics.
+
+    ``grad_clip_norm > 0`` clips the global gradient norm of the trainable
+    parameters to that value before the step; ``0`` (Tinker's default) disables
+    clipping. ``grad_norm:mean`` in the result is the pre-clip global norm.
+    """
     optim_step_params = _adam_params_to_optim_step_params(adam_params)
-    metrics = await asyncio.to_thread(engine.optim_step, optim_step_params)
+    grad_clip_norm = _grad_clip_norm_from_adam_params(adam_params)
+    if grad_clip_norm is None:
+        metrics = await asyncio.to_thread(engine.optim_step, optim_step_params)
+    else:
+        metrics = await asyncio.to_thread(engine.optim_step, optim_step_params, grad_clip_norm=grad_clip_norm)
+    metrics = _coerce_verl_metrics_to_floats(_merge_worker_metric_dicts(metrics) or {})
+    if "grad_norm:mean" in metrics:
+        # Tinker's name for the pre-clip global gradient norm.
+        metrics["unclipped_grad_l2:mean"] = metrics["grad_norm:mean"]
     return {
         "type": "optim_step",
-        "metrics": _coerce_verl_metrics_to_floats(_merge_worker_metric_dicts(metrics) or {}),
+        "metrics": metrics,
     }
 
 
@@ -422,6 +563,12 @@ def _apply_sampling_stop(sampling_params: dict[str, Any], stop: Any) -> None:
     raise TypeError("Sampling stop sequences must contain only strings or only token ids")
 
 
+def _scalar_prompt_logprobs(raw: list, prompt_len: int) -> list[float | None]:
+    """``prompt_logprobs=0`` rows -> Tinker shape: leading None, then one value per scored position."""
+    scored = [(pos[0] if isinstance(pos, list) and pos else None) for pos in raw]
+    return [None] + scored[: max(0, prompt_len - 1)]
+
+
 async def sample(engine, req) -> dict:
     prompt_ids = list(req.prompt.to_ints())
     num_samples = int(req.num_samples)
@@ -465,6 +612,20 @@ async def sample(engine, req) -> dict:
             }
         )
 
+    topk_sample = int(getattr(req, "topk_sample_logprobs", 0) or 0)
+    if topk_sample > 0:
+        topk_rows = await asyncio.gather(
+            *[
+                _sampled_topk_logprobs(engine, prompt_ids, sequence["tokens"], topk_sample, sampling_params)
+                for sequence in sequences
+            ]
+        )
+        pin = _sampling_is_unmodified(sampling_params)
+        for sequence, rows in zip(sequences, topk_rows, strict=True):
+            if pin:
+                rows = _pin_sampled_entries(rows, sequence["tokens"], sequence["logprobs"])
+            sequence["topk_logprobs"] = rows
+
     extras = getattr(results[0], "extra_fields", None) or {}
     prompt_ids_raw = extras.get("prompt_ids")
     prompt_lp_raw = extras.get("prompt_logprobs")
@@ -475,8 +636,18 @@ async def sample(engine, req) -> dict:
             formatted = _format_topk_prompt_logprobs(prompt_ids_raw, prompt_lp_raw) or []
             topk_prompt_logprobs_out = [[]] + formatted[: max(0, len(prompt_ids) - 1)]
         else:
-            scored = [(pos[0] if isinstance(pos, list) and pos else None) for pos in prompt_lp_raw]
-            prompt_logprobs_out = [None] + scored[: max(0, len(prompt_ids) - 1)]
+            prompt_logprobs_out = _scalar_prompt_logprobs(prompt_lp_raw, len(prompt_ids))
+    if req.prompt_logprobs and req.topk_prompt_logprobs:
+        # Tinker returns both fields when both are requested. The top-k rows need
+        # not contain the actual prompt token, so score it in one scalar pass.
+        scalar_params = {k: v for k, v in sampling_params.items() if k not in {"stop", "stop_token_ids"}}
+        scalar_params.update(max_tokens=1, prompt_logprobs=0)
+        scalar = await engine.generate(
+            request_id=uuid.uuid4().hex, prompt_ids=prompt_ids, sampling_params=scalar_params
+        )
+        scalar_raw = (getattr(scalar, "extra_fields", None) or {}).get("prompt_logprobs")
+        if scalar_raw is not None:
+            prompt_logprobs_out = _scalar_prompt_logprobs(scalar_raw, len(prompt_ids))
 
     return {
         "type": "sample",

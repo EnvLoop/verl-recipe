@@ -33,7 +33,7 @@ import numpy as np
 import torch
 from pydantic import BaseModel
 from tensordict import NonTensorData, NonTensorStack, TensorDict
-from tinker.types import Datum, ModelID
+from tinker.types import CreateModelRequest, Datum, ModelID, SampleRequest
 
 from verl.utils import tensordict_utils as tu
 
@@ -46,18 +46,24 @@ TinkerLossFnType = Literal[
     "ppo",
     "cispo",
     "dro",
+    "gspo",
     "custom_from_config",
 ]
-"""Tinker's five wire losses plus verl-tinker's server-configured extension."""
+"""Tinker's wire losses (incl. ``gspo``) plus verl-tinker's server-configured extension."""
 
 
 @dataclass(frozen=True)
 class TinkerForwardBackwardInput:
-    """Tinker ForwardBackwardInput extended with ``custom_from_config``."""
+    """Tinker ForwardBackwardInput extended with ``gspo`` and ``custom_from_config``.
+
+    ``loss_fn_config`` mirrors the SDK's ``Mapping[str, float | str]`` so string
+    values reach ``normalize_loss_spec`` and get a typed 422 instead of a
+    pydantic parse error.
+    """
 
     data: list[Datum]
     loss_fn: TinkerLossFnType
-    loss_fn_config: Optional[dict[str, float]] = field(default=None)
+    loss_fn_config: Optional[dict[str, float | str]] = field(default=None)
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,30 @@ class TinkerForwardBackwardRequest:
     forward_backward_input: TinkerForwardBackwardInput
     model_id: ModelID
     seq_id: Optional[int] = None
+
+
+class TinkerSampleRequest(SampleRequest):
+    """``tinker.types.SampleRequest`` plus the SDK 0.30 sampling fields.
+
+    The pinned server-side ``tinker`` types (0.19) forbid unknown fields, so the
+    newer SDK fields are declared here explicitly:
+
+    * ``topk_sample_logprobs``: top-k logprobs at every sampled position.
+    * ``target_prompt_logprobs``: scoring of caller-chosen ids at prompt
+      positions; accepted for parsing but rejected with a typed 400 because the
+      vLLM rollout path cannot score arbitrary ids.
+    * ``record_stability_info``: accepted and ignored.
+    """
+
+    topk_sample_logprobs: int = 0
+    target_prompt_logprobs: Optional[dict[str, Any]] = None
+    record_stability_info: Optional[bool] = None
+
+
+class TinkerCreateModelRequest(CreateModelRequest):
+    """``tinker.types.CreateModelRequest`` accepting the SDK 0.30 ``optimizer_config``."""
+
+    optimizer_config: Optional[dict[str, Any]] = None
 
 
 # ==================== TensorData ====================

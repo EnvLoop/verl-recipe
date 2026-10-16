@@ -56,11 +56,16 @@ class _Engine:
 
 
 class _OptimStepEngine:
+    _UNSET = object()
+
     def __init__(self):
         self.optim_step_params = None
+        self.grad_clip_norm = self._UNSET
 
-    def optim_step(self, optim_step_params=None):
+    def optim_step(self, optim_step_params=None, **kwargs):
         self.optim_step_params = optim_step_params
+        if "grad_clip_norm" in kwargs:
+            self.grad_clip_norm = kwargs["grad_clip_norm"]
         return [{"grad_norm": 1.0}, {}, {"grad_norm": 3.0, "lr": 1e-5}]
 
 
@@ -120,7 +125,8 @@ def _cross_entropy_datum(prefix, target_tokens):
     return SimpleNamespace(
         model_input=SimpleNamespace(to_ints=lambda: prefix),
         loss_fn_inputs={
-            "target_tokens": SimpleNamespace(data=target_tokens),
+            "target_tokens": SimpleNamespace(data=target_tokens, dtype="int64", shape=[len(target_tokens)]),
+            "weights": SimpleNamespace(data=[1.0] * len(target_tokens), dtype="float32", shape=[len(target_tokens)]),
         },
     )
 
@@ -208,6 +214,34 @@ async def test_sample_formats_topk_prompt_logprobs_for_current_tinker_schema():
     if hasattr(SampleResponse, "model_validate"):
         response = SampleResponse.model_validate(result)
         assert response.topk_prompt_logprobs == expected
+
+
+@pytest.mark.asyncio
+async def test_sample_returns_scalar_and_topk_prompt_logprobs_together():
+    req = SimpleNamespace(
+        prompt=_Prompt(),
+        sampling_params=SimpleNamespace(max_tokens=4, temperature=0.7, top_p=0.9, top_k=20, stop=None, seed=None),
+        num_samples=1,
+        prompt_logprobs=True,
+        topk_prompt_logprobs=2,
+    )
+
+    class RecordingEngine(_Engine):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        async def generate(self, request_id, prompt_ids, sampling_params):
+            self.calls.append(dict(sampling_params))
+            return await super().generate(request_id, prompt_ids, sampling_params)
+
+    engine = RecordingEngine()
+    result = await sample(engine, req)
+
+    assert result["topk_prompt_logprobs"] == [[], [(11, -1.1), (12, -2.2)], [(13, -3.3)]]
+    assert result["prompt_logprobs"] == [None, -1.1, -3.3]
+    assert [call["prompt_logprobs"] for call in engine.calls] == [2, 0]
+    assert engine.calls[1]["max_tokens"] == 1
 
 
 @pytest.mark.asyncio
@@ -388,10 +422,13 @@ async def test_optim_step_merges_one_to_all_worker_metrics(monkeypatch):
         "type": "optim_step",
         "metrics": {
             "grad_norm:mean": 2.0,
+            "unclipped_grad_l2:mean": 2.0,
             "lr:mean": 1e-5,
         },
     }
     assert engine.optim_step_params is None
+    # No AdamParams at all: keep the server-start clip_grad.
+    assert engine.grad_clip_norm is _OptimStepEngine._UNSET
 
 
 @pytest.mark.asyncio
@@ -417,17 +454,21 @@ async def test_optim_step_passes_adam_params_as_verl_optim_step_params(monkeypat
         "eps": 1e-7,
         "weight_decay": 0.01,
     }
+    # Tinker default grad_clip_norm=0.0 means "no clipping" and is forwarded as such.
+    assert engine.grad_clip_norm == 0.0
 
 
 @pytest.mark.asyncio
-async def test_optim_step_warns_for_ignored_grad_clip_override(monkeypatch):
+async def test_optim_step_forwards_grad_clip_norm_and_reports_pre_clip_norm(monkeypatch, recwarn):
     monkeypatch.setattr("verl_tinker.tinker_ops.asyncio.to_thread", _to_thread_inline)
     engine = _OptimStepEngine()
 
-    with pytest.warns(UserWarning, match="grad_clip_norm is accepted"):
-        await optim_step(engine, AdamParams(learning_rate=2e-5, grad_clip_norm=1.0))
+    result = await optim_step(engine, AdamParams(learning_rate=2e-5, grad_clip_norm=1.0))
 
     assert engine.optim_step_params["lr"] == 2e-5
+    assert engine.grad_clip_norm == 1.0
+    assert result["metrics"]["grad_norm:mean"] == 2.0
+    assert not [w for w in recwarn if "grad_clip_norm" in str(w.message)]
 
 
 @pytest.mark.asyncio

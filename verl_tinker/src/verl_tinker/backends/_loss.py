@@ -21,20 +21,23 @@ once at init.
 """
 
 from copy import deepcopy
-from dataclasses import replace
 
 from omegaconf import DictConfig
 
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.utils.losses import ppo_loss
 
-__all__ = ["is_ref_in_actor", "make_branching_loss"]
+from ..tinker_losses import (
+    CUSTOM_FROM_CONFIG,
+    GSPO_CLIPPED_SEQUENCES,
+    GSPO_LOG_RATIO_TOTAL,
+    GSPO_NUM_SEQUENCES,
+    TINKER_RL_LOSSES,
+    masked_loss_mat,
+    rl_token_losses,
+)
 
-# VERL clamps PPO's log-ratio to 20 before exponentiating, so the largest
-# ratio that can reach the dual-clip branch is exp(20) ~= 4.85e8. Tinker PPO
-# has no third/dual clip; a finite value above that bound disables it while
-# satisfying VERL's ``clip_ratio_c > 1`` validation.
-_TINKER_PPO_DUAL_CLIP_C = 1e9
+__all__ = ["is_ref_in_actor", "make_branching_loss"]
 
 
 def is_ref_in_actor(config: DictConfig) -> bool:
@@ -81,6 +84,7 @@ def make_branching_loss(config: DictConfig):
     from verl.utils import tensordict_utils as tu
     from verl.utils.dataset.dataset_utils import DatasetPadMode
     from verl.utils.metric import AggregationType, Metric
+    from verl.workers.utils.padding import no_padding_2_padding
 
     # ``ppo_loss`` reads ``clip_ratio /
     # loss_agg_mode / policy_loss / use_kl_loss / global_batch_info /
@@ -94,52 +98,54 @@ def make_branching_loss(config: DictConfig):
     # validation.
     actor_cfg = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
 
-    def actor_config_for(spec: dict):
-        """Build an isolated request config; ppo_loss mutates global_batch_info."""
-        loss_name = spec["name"]
-        if loss_name == "custom_from_config":
-            # Preserve every startup setting while isolating mutable fields that
-            # verl updates during ppo_loss (notably global_batch_info).
-            return deepcopy(actor_cfg)
+    def custom_from_config_actor_config():
+        """Isolated copy of the startup actor config; ppo_loss mutates global_batch_info."""
+        # Preserve every startup setting while isolating mutable fields that
+        # verl updates during ppo_loss (notably global_batch_info).
+        return deepcopy(actor_cfg)
 
-        loss_mode = {
-            "ppo": "vanilla",
-            # Tinker's ``logprobs`` are behavior/rollout-policy log probs and
-            # are translated to ``old_log_probs``. That is already VERL's
-            # bypass-mode input contract, so compute token-TIS in the loss.
-            "importance_sampling": "bypass_mode",
-        }.get(loss_name, loss_name)
-        rollout_correction = replace(actor_cfg.policy_loss.rollout_correction)
-        if loss_name == "importance_sampling":
-            rollout_correction = replace(
-                rollout_correction,
-                rollout_is="token",
-                rollout_is_threshold=2.0,
-                rollout_is_batch_normalize=False,
-                rollout_rs=None,
-                rollout_rs_threshold=None,
-                bypass_mode=True,
-                loss_type="reinforce",
-            )
-        policy_loss = replace(
-            actor_cfg.policy_loss,
-            loss_mode=loss_mode,
-            dro_beta=spec.get("dro_beta", actor_cfg.policy_loss.dro_beta),
-            rollout_correction=rollout_correction,
+    def tinker_rl_final_loss(spec: dict, model_output, data):
+        """Tinker RL losses (IS / PPO / CISPO / DRO / GSPO) with token-sum reduction.
+
+        Same plumbing as VeRL's ``ppo_loss`` (response-window log-probs, rectangular
+        response tensors, ``agg_loss(token-sum)`` scaled by ``dp_size`` so the
+        DP-averaged gradient equals the global token sum) but the per-token
+        objective is ``tinker_losses.rl_token_losses``, i.e. exactly the formulas
+        in the Tinker loss docs (untruncated IS ratio, no dual clip, GSPO-token).
+        """
+        log_prob = no_padding_2_padding(model_output["log_probs"], data)
+        fields = ["response_mask", "old_log_probs", "advantages"]
+        has_ratio_mask = "sequence_ratio_mask" in data.keys()
+        if has_ratio_mask:
+            fields.append("sequence_ratio_mask")
+        padded = data.select(*fields).to_padded_tensor()
+        mask = padded["response_mask"].to(torch.bool)
+        ratio_mask = padded["sequence_ratio_mask"] if has_ratio_mask else mask
+        out = rl_token_losses(
+            spec,
+            target_logprobs=log_prob,
+            sampling_logprobs=padded["old_log_probs"],
+            advantages=padded["advantages"],
+            sequence_ratio_mask=ratio_mask if spec["name"] == "gspo" else None,
         )
-        overrides = {
-            "policy_loss": policy_loss,
-            "loss_agg_mode": "token-sum",
-            "entropy_coeff": 0.0,
-            "use_kl_loss": False,
-            "global_batch_info": {},
-        }
-        if loss_name in {"ppo", "cispo"}:
-            overrides["clip_ratio_low"] = spec["clip_ratio_low"]
-            overrides["clip_ratio_high"] = spec["clip_ratio_high"]
-        if loss_name == "ppo":
-            overrides["clip_ratio_c"] = _TINKER_PPO_DUAL_CLIP_C
-        return replace(actor_cfg, **overrides)
+        loss = agg_loss(
+            loss_mat=masked_loss_mat(out.loss_mat, mask),
+            loss_mask=mask,
+            loss_agg_mode="token-sum",
+            dp_size=data["dp_size"],
+        )
+        metrics = {"loss": Metric(value=loss, aggregation=AggregationType.SUM)}
+        if spec["name"] == "gspo":
+            # Filler rows (DP padding / zero-loss datums) carry no ratio tokens.
+            valid = out.seq_has_ratio & mask.any(dim=-1)
+            metrics[GSPO_LOG_RATIO_TOTAL] = Metric(
+                value=float(out.seq_log_ratio[valid].sum().item()), aggregation=AggregationType.SUM
+            )
+            metrics[GSPO_NUM_SEQUENCES] = Metric(value=float(valid.sum().item()), aggregation=AggregationType.SUM)
+            metrics[GSPO_CLIPPED_SEQUENCES] = Metric(
+                value=float((out.seq_clipped & valid).sum().item()), aggregation=AggregationType.SUM
+            )
+        return loss, metrics
 
     def sft_final_loss(model_output, data, dp_group=None):
         """Tinker weighted cross entropy uses a global token-sum reduction."""
@@ -177,7 +183,13 @@ def make_branching_loss(config: DictConfig):
         student_log_probs = F.log_softmax(student_logits, dim=-1)  # (1, total_nnz, V)
         student_topk = student_log_probs.gather(-1, tids)  # (1, total_nnz, K)
 
-        teacher_weights = tlp.exp()  # (1, total_nnz, K) — 0 at invalid slots (log(0)→-10→exp~5e-5; tiny)
+        if "teacher_weights" in data.keys():
+            # Raw wire weights (any sign, exact zeros on invalid slots): Tinker's
+            # top-K cross_entropy is -sum_k w_k * log p(x_k), which is also the
+            # linear surrogate forward_backward_custom relies on.
+            teacher_weights = data["teacher_weights"].values().unsqueeze(0).to(student_topk.dtype)
+        else:
+            teacher_weights = tlp.exp()  # (1, total_nnz, K) — 0 at invalid slots (log(0)→-10→exp~5e-5; tiny)
         # Weighted CE per position: -Σ_k w_k · log_student[k].
         distillation_losses = -(teacher_weights * student_topk).sum(-1)  # (1, total_nnz)
         teacher_mass = teacher_weights.sum(dim=-1)
@@ -239,7 +251,11 @@ def make_branching_loss(config: DictConfig):
         spec = tu.get_non_tensor_data(data=data, key="__tinker_loss_spec__", default=None)
         if spec is None:
             raise RuntimeError("Internal RL TensorDict is missing normalized __tinker_loss_spec__ metadata")
-        request_cfg = actor_config_for(spec)
+        if spec["name"] in TINKER_RL_LOSSES:
+            return tinker_rl_final_loss(spec, model_output, data)
+        if spec["name"] != CUSTOM_FROM_CONFIG:
+            raise RuntimeError(f"Unsupported normalized loss spec {spec['name']!r} on the RL TensorDict path")
+        request_cfg = custom_from_config_actor_config()
         loss, metrics = ppo_loss(config=request_cfg, model_output=model_output, data=data, dp_group=dp_group)
         metrics["loss"] = Metric(value=loss, aggregation=AggregationType.SUM)
         return loss, metrics

@@ -4,18 +4,20 @@ import torch
 from fastapi import HTTPException
 from tensordict import TensorDict
 
+from ..tinker_losses import TINKER_RL_LOSSES, rl_loss_mask, sampled_token_mask, tensor_data_to_torch
+
 # ============================================================
 # Datum → TensorDict translation (inverse of data_converter.py)
 # ============================================================
 
 
 def _tensor_data_to_torch(td) -> torch.Tensor:
-    """Inverse of TensorData.from_torch — pydantic TensorData to a flat torch tensor."""
-    dtype = torch.float32 if td.dtype == "float32" else torch.int64
-    t = torch.tensor(td.data, dtype=dtype)
-    if td.shape and len(td.shape) > 1:
-        t = t.view(*td.shape)
-    return t
+    """Inverse of TensorData.from_torch / from_torch_sparse — wire TensorData to a dense torch tensor.
+
+    Sparse CSR tensors (the SDK sends 2-D ``target_tokens`` / ``weights`` that
+    way when it saves space) are densified.
+    """
+    return tensor_data_to_torch(td)
 
 
 def _coerce_one_metric_value(v) -> Optional[float]:
@@ -135,7 +137,11 @@ def _coerce_verl_metrics_to_floats(raw_metrics) -> dict[str, float]:
 
 
 def _datums_to_update_actor_td(
-    datums, mini_batch_size: int, temperature: float = 1.0, pad_to_multiple: int = 1
+    datums,
+    mini_batch_size: int,
+    temperature: float = 1.0,
+    pad_to_multiple: int = 1,
+    loss_name: Optional[str] = None,
 ) -> TensorDict:
     """Translate a Tinker forward_backward payload (list[Datum]) into the
     TensorDict shape expected by verl's actor_rollout_wg.forward_backward.
@@ -167,7 +173,17 @@ def _datums_to_update_actor_td(
         from non-zero advantages (which is unreliable in PPO, where genuine
         zero advantages occur when V-hat predicts the return exactly).
       - response_start_full = response_start_in_target + 1   (target = tokens[1:])
+
+    For Tinker's RL losses (``loss_name`` in ``TINKER_RL_LOSSES``) the wire
+    carries exactly ``target_tokens`` / ``logprobs`` / ``advantages`` (+
+    ``sequence_ratio_mask`` for ``gspo``) and, like Tinker, the loss is summed
+    over every target position: the response window is the whole sequence
+    after its first token (VeRL needs a non-empty prompt). ``gspo``
+    additionally gets a rectangular ``sequence_ratio_mask`` (defaulting to the
+    sampled-completion positions, ``logprob != 0 or advantage != 0``).
     """
+    tinker_rl = loss_name in TINKER_RL_LOSSES
+    gspo = loss_name == "gspo"
     if not datums:
         raise HTTPException(
             status_code=422,
@@ -182,6 +198,7 @@ def _datums_to_update_actor_td(
     per_sample_old_logp = []
     per_sample_advantages = []
     per_sample_rollout_isw: list[Optional[torch.Tensor]] = []
+    per_sample_ratio_mask = []
 
     for d in datums:
         prefix = list(d.model_input.to_ints())  # tokens[:-1]
@@ -205,7 +222,14 @@ def _datums_to_update_actor_td(
         #      never exactly 0 under stochastic sampling, so this is a
         #      reliable fallback even when the whole sample's advantage is
         #      zero (a trajectory whose reward equals the group mean).
-        if "response_mask" in loss_inputs:
+        padded_ratio_mask = None
+        if gspo and "sequence_ratio_mask" in loss_inputs:
+            padded_ratio_mask = (_tensor_data_to_torch(loss_inputs["sequence_ratio_mask"]) != 0).float()
+        if gspo and padded_ratio_mask is None:
+            padded_ratio_mask = sampled_token_mask(padded_logp, padded_adv).float()
+        if tinker_rl:
+            padded_mask = rl_loss_mask(padded_adv.numel()).float()
+        elif "response_mask" in loss_inputs:
             padded_mask = _tensor_data_to_torch(loss_inputs["response_mask"]).float()
         elif "mask" in loss_inputs:
             padded_mask = _tensor_data_to_torch(loss_inputs["mask"]).float()
@@ -251,6 +275,10 @@ def _datums_to_update_actor_td(
         old_log_probs = padded_logp[response_start_in_target : response_start_in_target + response_len]
         advantages = padded_adv[response_start_in_target : response_start_in_target + response_len]
         resp_mask = padded_mask[response_start_in_target : response_start_in_target + response_len]
+        if gspo:
+            per_sample_ratio_mask.append(
+                padded_ratio_mask[response_start_in_target : response_start_in_target + response_len].float()
+            )
 
         # Optional client-supplied importance-sampling correction. verl's
         # ``compute_policy_loss_*`` family reads ``data["rollout_is_weights"]``
@@ -298,6 +326,8 @@ def _datums_to_update_actor_td(
             per_sample_old_logp.append(torch.zeros_like(per_sample_old_logp[0]))
             per_sample_advantages.append(torch.zeros_like(per_sample_advantages[0]))
             per_sample_rollout_isw.append(torch.zeros_like(per_sample_old_logp[0]) if real_has_isw else None)
+            if gspo:
+                per_sample_ratio_mask.append(torch.zeros_like(per_sample_ratio_mask[0]))
 
     B = len(per_sample_fulls)
     max_seq = max(t.numel() for t in per_sample_fulls)
@@ -350,6 +380,12 @@ def _datums_to_update_actor_td(
         "old_log_probs": old_log_probs,
         "advantages": advantages,
     }
+    if gspo:
+        ratio_mask = torch.zeros(B, max_resp, dtype=torch.float32)
+        for i in range(B):
+            resp = per_sample_responses_tok[i].numel()
+            ratio_mask[i, :resp] = per_sample_ratio_mask[i]
+        td_fields["sequence_ratio_mask"] = ratio_mask
     if n_with_isw == B:
         rollout_isw = torch.zeros(B, max_resp, dtype=torch.float32)
         for i in range(B):
@@ -568,9 +604,14 @@ def _datums_to_topk_distill_td(
 
     The j1 axis aligns with verl's ``input_ids.offsets()`` over the full
     valid_len, same convention used by verl's ``log_probs`` jagged tensor
-    in ``prepare_model_outputs``. To match this we pad both teacher
-    tensors with one leading row of zeros (matching ``loss_mask[0]=0`` so
-    the roll-by-(-1) discards the wrap position).
+    in ``prepare_model_outputs``. Student logits at position ``i`` predict
+    token ``i + 1``, which is Tinker target row ``i``, so teacher row ``i``
+    is placed at position ``i`` (the vLLM prompt-logprob layout VeRL's own
+    distillation uses) and the unused last position gets a zero row. The
+    per-position losses are not rolled; only ``loss_mask`` is (by -1), so
+    ``loss_mask[i + 1] = active[i]`` selects row ``i`` at position ``i``.
+    (EnvLoop fix: upstream 242c73fc placed row ``i`` at position ``i + 1``,
+    pairing it with the wrong logits and dropping the last row.)
     """
     if not datums:
         raise HTTPException(
@@ -583,6 +624,7 @@ def _datums_to_topk_distill_td(
     per_sample_loss_masks = []
     per_sample_topk_ids = []
     per_sample_topk_log_probs = []
+    per_sample_topk_weights = []
     LOG_PROB_MIN_CLAMP = -10.0  # matches DistillationLossConfig default
 
     for d in datums:
@@ -638,28 +680,35 @@ def _datums_to_topk_distill_td(
         # shifted to align with verl's roll-by-(-1) convention. Same as 1-D
         # path: loss_mask[i+1] = (weights[i, :].sum() > 0) for i in [0, prefix_len),
         # loss_mask[0] = 0.
-        per_pos_active = (weights.sum(dim=-1) > 0).float()  # (target_len,)
+        # Any nonzero weight (of either sign: forward_backward_custom sends
+        # ``weights = -dC/dlogprobs``) makes the position active.
+        per_pos_active = (weights != 0).any(dim=-1).float()  # (target_len,)
         loss_mask = torch.zeros(valid_len, dtype=torch.float32)
         loss_mask[1:] = per_pos_active
 
-        # teacher_ids / teacher_logprobs: pad with a zero row at
-        # position 0 (wrap slot) so the j1 axis matches input_ids' valid_len.
-        # verl rolls these by -1 alongside the loss_mask to align with the
-        # student logits at predict-next-token positions.
+        # teacher_ids / teacher_logprobs / teacher_weights: row i at position
+        # i (aligned with the student logits that predict token i + 1), plus a
+        # zero row at the unused last position so the j1 axis matches
+        # input_ids' valid_len.
         ids_padded = torch.zeros(valid_len, K, dtype=torch.long)
-        ids_padded[1:] = target
+        ids_padded[:-1] = target
         lp_padded = torch.full((valid_len, K), LOG_PROB_MIN_CLAMP, dtype=torch.float32)
         # log(weights) with -10.0 clamp on zeros so exp() yields ~0.
         log_weights = torch.where(
             weights > 0, weights.clamp_min(1e-12).log(), torch.full_like(weights, LOG_PROB_MIN_CLAMP)
         )
-        lp_padded[1:] = log_weights
+        lp_padded[:-1] = log_weights
+        # Raw weights for the eager logit processor, so the loss is exactly
+        # -sum_k w_k * log p(x_k) for arbitrary (incl. negative) float weights.
+        w_padded = torch.zeros(valid_len, K, dtype=torch.float32)
+        w_padded[:-1] = weights
 
         per_sample_fulls.append(full)
         per_sample_positions.append(torch.arange(valid_len, dtype=torch.long))
         per_sample_loss_masks.append(loss_mask)
         per_sample_topk_ids.append(ids_padded)
         per_sample_topk_log_probs.append(lp_padded)
+        per_sample_topk_weights.append(w_padded)
 
     # World-size divisibility padding (see _datums_to_update_actor_td). Filler
     # rows clone the first sample with an all-zero loss_mask; the topk_ids /
@@ -672,6 +721,7 @@ def _datums_to_topk_distill_td(
         per_sample_loss_masks.append(torch.zeros_like(per_sample_loss_masks[0]))
         per_sample_topk_ids.append(per_sample_topk_ids[0].clone())
         per_sample_topk_log_probs.append(per_sample_topk_log_probs[0].clone())
+        per_sample_topk_weights.append(torch.zeros_like(per_sample_topk_weights[0]))
 
     B = len(per_sample_fulls)
     td = TensorDict(
@@ -681,6 +731,7 @@ def _datums_to_topk_distill_td(
             "loss_mask": torch.nested.as_nested_tensor(per_sample_loss_masks, layout=torch.jagged),
             "teacher_ids": torch.nested.as_nested_tensor(per_sample_topk_ids, layout=torch.jagged),
             "teacher_logprobs": torch.nested.as_nested_tensor(per_sample_topk_log_probs, layout=torch.jagged),
+            "teacher_weights": torch.nested.as_nested_tensor(per_sample_topk_weights, layout=torch.jagged),
         },
         batch_size=[B],
     )

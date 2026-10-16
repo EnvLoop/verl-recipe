@@ -18,7 +18,7 @@ import asyncio
 import logging
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from enum import Enum
@@ -28,20 +28,20 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
+from omegaconf import DictConfig
 from ray import serve
 from tinker.types import (
-    CreateModelRequest,
     CreateSamplingSessionRequest,
     CreateSamplingSessionResponse,
     FutureRetrieveRequest,
     GetInfoRequest,
     OptimStepRequest,
-    SampleRequest,
     SaveWeightsForSamplerRequest,
 )
 
 from .backends.colocated import ColocatedBackend
 from .backends.teacher import TeacherInferenceBackend
+from .lora_info import LoraInfo, configured_lora_info
 from .model_resource_manager import (
     ModelResourceManager,
     ModelResourceManagerError,
@@ -49,7 +49,14 @@ from .model_resource_manager import (
     StaleSamplerError,
     UnknownSamplerError,
 )
-from .schemas import StatusResponse, TinkerForwardBackwardRequest, TinkerForwardRequest
+from .schemas import (
+    StatusResponse,
+    TinkerCreateModelRequest,
+    TinkerForwardBackwardRequest,
+    TinkerForwardRequest,
+    TinkerSampleRequest,
+)
+from .tinker_losses import LossContractError
 from .tinker_ops import (
     forward as tinker_forward,
 )
@@ -63,6 +70,7 @@ from .tinker_ops import (
     load_state_metadata,
     save_state,
     state_path_to_local,
+    validate_tinker_loss_request,
 )
 from .tinker_ops import (
     optim_step as tinker_optim_step,
@@ -81,8 +89,16 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="VeRL Tinker Server", version="0.1.0")
 
+# Only used for full-parameter servers (lora_rank == 0): the Tinker SDK's
+# create_training_client_from_state asserts LoRA metadata before load_state.
 TINKER_COOKBOOK_COMPAT_LORA_RANK = 1
 MAX_REQUEST_STATUS_ENTRIES = 100_000
+# vLLM's default ``max_logprobs``; override with ``server.max_topk_logprobs``.
+DEFAULT_MAX_TOPK_LOGPROBS = 20
+
+
+def _typed_error(status: HTTPStatus, code: str, message: str) -> HTTPException:
+    return HTTPException(status, {"code": code, "message": message})
 
 
 class ServerStatus(str, Enum):
@@ -270,12 +286,72 @@ class TinkerServer:
             except Exception:
                 logger.exception("Failed to close rejected scheduled coroutine")
 
-    def _metadata_from_create_model(self, req: CreateModelRequest) -> dict[str, Any]:
-        return {
-            "base_model": req.base_model,
-            "is_lora": False,
-            "lora_rank": None,
-        }
+    def _lora_info(self) -> LoraInfo:
+        """LoRA configuration this server was started with (rank 0 = full-parameter)."""
+        info = getattr(self, "_configured_lora", None)
+        if info is None:
+            config = getattr(self, "config", None)
+            if config is None and getattr(self, "_engine", None) is not None:
+                config = getattr(self._engine, "config", None)
+            info = configured_lora_info(config)
+            self._configured_lora = info
+        return info
+
+    def _server_option(self, key: str, default: Any) -> Any:
+        config = getattr(self, "config", None)
+        if config is None and getattr(self, "_engine", None) is not None:
+            config = getattr(self._engine, "config", None)
+        if not isinstance(config, (DictConfig, Mapping)):
+            return default
+        server = config.get("server")
+        if not isinstance(server, (DictConfig, Mapping)):
+            return default
+        value = server.get(key, default)
+        return default if value is None else value
+
+    def _metadata_from_create_model(self, req: TinkerCreateModelRequest) -> dict[str, Any]:
+        return {"base_model": req.base_model, **self._lora_info().metadata()}
+
+    def _check_create_model_lora(self, req: TinkerCreateModelRequest) -> None:
+        """The adapter rank is fixed at server start; a different requested rank is a 409."""
+        optimizer_config = getattr(req, "optimizer_config", None)
+        optimizer_type = (
+            optimizer_config.get("type")
+            if isinstance(optimizer_config, dict)
+            else getattr(optimizer_config, "type", None)
+        )
+        if optimizer_type not in (None, "adamw"):
+            raise _typed_error(
+                HTTPStatus.BAD_REQUEST,
+                "OPTIMIZER_UNSUPPORTED",
+                f"optimizer_config.type={optimizer_type!r} is not supported; this server only runs AdamW",
+            )
+
+        info = self._lora_info()
+        lora_config = getattr(req, "lora_config", None)
+        if lora_config is None or not info.is_lora:
+            # Full-parameter servers train every weight and ignore lora_config.
+            return
+        requested_rank = int(getattr(lora_config, "rank", info.rank))
+        if requested_rank != info.rank:
+            raise HTTPException(
+                HTTPStatus.CONFLICT,
+                f"create_model requested LoRA rank {requested_rank}, but this server was started with "
+                f"LoRA rank {info.rank} (actor_rollout_ref.model.lora_rank); the adapter rank cannot change "
+                f"at runtime. Request rank={info.rank} or start a server with the desired rank.",
+            )
+        for flag in ("train_attn", "train_mlp", "train_unembed"):
+            requested = getattr(lora_config, flag, None)
+            if requested is not None and bool(requested) != getattr(info, flag):
+                logger.warning(
+                    "create_model requested %s=%s but the server adapter (target_modules=%r) has %s=%s; "
+                    "training uses the server configuration",
+                    flag,
+                    requested,
+                    info.target_modules,
+                    flag,
+                    getattr(info, flag),
+                )
 
     def _current_model_metadata(self, model_id: str) -> dict[str, Any]:
         metadata = self._model_metadata.get(model_id)
@@ -286,10 +362,17 @@ class TinkerServer:
             )
         return metadata
 
-    def _weights_info_compat_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
-        # Tinker cookbook's public checkpoint reload path currently assumes LoRA
-        # metadata before it calls load_weights. The local VeRL backend is still a
-        # full-model server; this compatibility shape is only for /weights_info.
+    def _weights_info_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        info = self._lora_info()
+        if info.is_lora:
+            if metadata.get("is_lora") and metadata.get("lora_rank") is not None:
+                return dict(metadata)
+            # Checkpoint metadata written before the LoRA fields were recorded:
+            # report the adapter this server trains.
+            return {**metadata, **info.metadata()}
+        # Full-parameter server. The Tinker SDK's create_training_client_from_state
+        # asserts LoRA metadata before load_state, so keep the cookbook-compatible
+        # shape here (create_model on a full-parameter server accepts any rank).
         return {
             **metadata,
             "is_lora": True,
@@ -299,9 +382,34 @@ class TinkerServer:
             "train_attn": True,
         }
 
+    def _validate_loss_request(self, loss_input, *, forward_only: bool) -> None:
+        try:
+            validate_tinker_loss_request(
+                loss_input.loss_fn,
+                loss_input.loss_fn_config,
+                loss_input.data,
+                forward_only=forward_only,
+            )
+        except LossContractError as exc:
+            raise HTTPException(HTTPStatus.UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    @staticmethod
+    def _optim_params(req: OptimStepRequest):
+        """AdamParams from either the 0.19 (``adam_params``) or 0.30 (``optim_params``) request type."""
+        params = getattr(req, "optim_params", None)
+        if params is None:
+            params = getattr(req, "adam_params", None)
+        if getattr(params, "type", None) == "dimuon":
+            raise _typed_error(
+                HTTPStatus.BAD_REQUEST,
+                "OPTIMIZER_UNSUPPORTED",
+                "Dimuon optimizer params are not supported; this server only runs AdamW",
+            )
+        return params
+
     async def _run_optim_step(self, req: OptimStepRequest) -> dict:
         try:
-            result = await tinker_optim_step(self._get_engine(), req.adam_params)
+            result = await tinker_optim_step(self._get_engine(), self._optim_params(req))
         except BaseException:
             # An optimizer failure may have partially changed weights. Give that
             # state a fresh identity so it can never compare equal to rollout.
@@ -508,12 +616,13 @@ class TinkerServer:
         # A client-provided base_model from create_model is request metadata and
         # must not override the configured model identity returned by get_info.
         model_name = get_configured_model_name(self._get_engine())
+        lora = self._lora_info().metadata()
         return {
             "type": "get_info",
             "model_data": {"arch": None, "model_name": model_name, "tokenizer_id": model_name},
             "model_id": req.model_id,
-            "is_lora": False,
-            "lora_rank": None,
+            "optimizer_config": {"type": "adamw"},
+            **lora,
             "model_name": model_name,
         }
 
@@ -545,8 +654,9 @@ class TinkerServer:
         return {"sessions": self._model_resource_manager.session_ids()}
 
     @app.post("/api/v1/create_model")
-    async def create_model(self, req: CreateModelRequest):
+    async def create_model(self, req: TinkerCreateModelRequest):
         self._require_ready()
+        self._check_create_model_lora(req)
         try:
             model_id = self._model_resource_manager.register_model(req.session_id, req.model_seq_id)
         except ModelResourceManagerError as exc:
@@ -597,7 +707,7 @@ class TinkerServer:
         metadata = load_state_metadata(self._checkpoint_root, self._saved_state_metadata, tinker_path)
         if metadata is None:
             raise HTTPException(HTTPStatus.NOT_FOUND, f"Unknown checkpoint path: {tinker_path}")
-        return self._weights_info_compat_metadata(metadata)
+        return self._weights_info_metadata(metadata)
 
     @app.post("/api/v1/session_heartbeat")
     async def session_heartbeat(self, body: dict = None):
@@ -611,14 +721,25 @@ class TinkerServer:
 
     @app.post("/api/v1/forward")
     async def forward(self, req: TinkerForwardRequest):
+        """Tinker ``forward(data, loss_fn, loss_fn_config)``: logprobs + loss, no gradients."""
         self._require_ready()
+        self._validate_loss_request(req.forward_input, forward_only=True)
         request_id = uuid.uuid4().hex
-        self._schedule(request_id, tinker_forward(self._get_engine(), req.forward_input.data))
+        self._schedule(
+            request_id,
+            tinker_forward(
+                self._get_engine(),
+                req.forward_input.data,
+                req.forward_input.loss_fn,
+                req.forward_input.loss_fn_config,
+            ),
+        )
         return self._future_envelope(request_id, model_id=req.model_id)
 
     @app.post("/api/v1/forward_backward")
     async def forward_backward(self, req: TinkerForwardBackwardRequest):
         self._require_ready()
+        self._validate_loss_request(req.forward_backward_input, forward_only=False)
         request_id = uuid.uuid4().hex
         self._schedule(
             request_id,
@@ -634,6 +755,7 @@ class TinkerServer:
     @app.post("/api/v1/optim_step")
     async def optim_step(self, req: OptimStepRequest):
         self._require_ready()
+        self._optim_params(req)
         request_id = uuid.uuid4().hex
         self._schedule(request_id, self._run_optim_step(req))
         return self._future_envelope(request_id, model_id=req.model_id)
@@ -660,9 +782,34 @@ class TinkerServer:
         self._schedule(request_id, self._run_load_state(req))
         return self._future_envelope(request_id, model_id=req.get("model_id"))
 
+    def _validate_sample_request(self, req) -> None:
+        if getattr(req, "target_prompt_logprobs", None) is not None:
+            raise _typed_error(
+                HTTPStatus.BAD_REQUEST,
+                "TARGET_PROMPT_LOGPROBS_UNSUPPORTED",
+                "target_prompt_logprobs is not supported by this server: the vLLM rollout only reports the "
+                "actual prompt token and the top-k candidates at each prompt position and cannot score "
+                "arbitrary token ids. Use topk_prompt_logprobs, or forward() for next-token logprobs.",
+            )
+        k = int(getattr(req, "topk_sample_logprobs", 0) or 0)
+        max_k = int(self._server_option("max_topk_logprobs", DEFAULT_MAX_TOPK_LOGPROBS))
+        if k < 0:
+            raise _typed_error(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "TOPK_SAMPLE_LOGPROBS_INVALID",
+                f"topk_sample_logprobs must be >= 0, got {k}",
+            )
+        if k > max_k:
+            raise _typed_error(
+                HTTPStatus.BAD_REQUEST,
+                "TOPK_SAMPLE_LOGPROBS_TOO_LARGE",
+                f"topk_sample_logprobs={k} exceeds this server's limit of {max_k} (vLLM max_logprobs)",
+            )
+
     @app.post("/api/v1/asample")
-    async def asample(self, req: SampleRequest):
+    async def asample(self, req: TinkerSampleRequest):
         self._require_ready()
+        self._validate_sample_request(req)
         try:
             binding = self._model_resource_manager.resolve_sampling_request(
                 sampling_session_id=req.sampling_session_id,
@@ -679,6 +826,7 @@ class TinkerServer:
             and getattr(getattr(req, "sampling_params", None), "max_tokens", None) == 1
             and getattr(req, "prompt_logprobs", None) is True
             and int(getattr(req, "topk_prompt_logprobs", 0)) == 0
+            and int(getattr(req, "topk_sample_logprobs", 0) or 0) == 0
         )
 
         async def _sample_with_late_binding():

@@ -80,7 +80,7 @@ def test_critic_routes_are_not_registered():
 
 def test_tinker_loss_schema_accepts_native_modes_and_custom_from_config_only():
     adapter = TypeAdapter(TinkerLossFnType)
-    supported = ("cross_entropy", "importance_sampling", "ppo", "cispo", "dro", "custom_from_config")
+    supported = ("cross_entropy", "importance_sampling", "ppo", "cispo", "dro", "gspo", "custom_from_config")
 
     assert tuple(adapter.validate_python(name) for name in supported) == supported
     loss_schema = app.openapi()["components"]["schemas"]["TinkerForwardBackwardInput"]["properties"]["loss_fn"]
@@ -205,13 +205,14 @@ def test_no_rollout_config_requires_trainer_runtime_fields():
     assert "trainer.n_gpus_per_node is required" in errors
 
 
-def test_create_model_metadata_is_full_model_training_even_with_lora_request():
+def test_create_model_metadata_on_full_parameter_server_ignores_lora_request():
     server = object.__new__(_router_class())
     req = SimpleNamespace(
         base_model="Qwen/Qwen3-1.7B",
         lora_config=SimpleNamespace(rank=128, train_unembed=True, train_mlp=True, train_attn=True),
     )
 
+    server._check_create_model_lora(req)
     assert server._metadata_from_create_model(req) == {
         "base_model": "Qwen/Qwen3-1.7B",
         "is_lora": False,
@@ -696,10 +697,10 @@ async def test_rollout_sync_failure_marks_rollout_unknown_without_shutting_down(
     assert server._shutdown_started is False
 
 
-def test_weights_info_metadata_uses_cookbook_lora_compat_shape():
+def test_weights_info_metadata_uses_cookbook_lora_compat_shape_on_full_parameter_server():
     server = object.__new__(_router_class())
 
-    assert server._weights_info_compat_metadata(
+    assert server._weights_info_metadata(
         {
             "base_model": "Qwen/Qwen3-1.7B",
             "is_lora": False,

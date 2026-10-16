@@ -55,6 +55,24 @@ from .model_lifecycle import ModelLifecycle, ModelRole
 logger = logging.getLogger("ray")
 
 
+def effective_clip_grad(grad_clip_norm: Optional[float]) -> Optional[float]:
+    """Map Tinker ``AdamParams.grad_clip_norm`` onto VeRL's ``optim.clip_grad``.
+
+    ``None`` keeps the server-start ``clip_grad``; ``> 0`` clips to that global
+    norm; ``0`` / negative disables clipping. VeRL always calls
+    ``clip_grad_norm_(max_norm=clip_grad)`` (and asserts it is not ``None``), so
+    "disabled" is ``inf``: the clip coefficient ``inf / (norm + eps)`` is
+    clamped to 1 and gradients are left unchanged, while the returned pre-clip
+    norm is still computed.
+    """
+    if grad_clip_norm is None:
+        return None
+    value = float(grad_clip_norm)
+    if value != value:  # NaN
+        raise ValueError("grad_clip_norm must be a number, got NaN")
+    return value if value > 0 else float("inf")
+
+
 class TinkerServerActorRolloutRefWorker(TinkerActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to_actor(self, device, model=True, optimizer=True, grad=True):
@@ -65,6 +83,54 @@ class TinkerServerActorRolloutRefWorker(TinkerActorRolloutRefWorker):
         if self.ref is None:
             return
         self.ref.to(device=device, model=model, optimizer=optimizer, grad=grad)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def optimizer_step_with_grad_clip(self, optim_step_params=None, grad_clip_norm=None):
+        """Tinker optimizer step with a per-step global grad-norm clip.
+
+        Temporarily overrides the actor engine's ``optimizer_config.clip_grad``
+        (a VeRL mutable field) for this step only; the engine's own
+        ``optimizer_step`` clips the global norm of all parameters that have a
+        gradient (the trainable LoRA / full parameters) and returns the
+        pre-clip norm, which the Tinker worker reports as ``grad_norm``.
+        """
+        assert "actor" in self.role, "optimizer_step_with_grad_clip only supports the actor role"
+        clip_grad = effective_clip_grad(grad_clip_norm)
+        optimizer_config = getattr(getattr(self.actor, "engine", None), "optimizer_config", None)
+        if clip_grad is None:
+            return self.actor.optimizer_step(optim_step_params=optim_step_params)
+        if optimizer_config is None or not hasattr(optimizer_config, "clip_grad"):
+            raise NotImplementedError(
+                f"{type(getattr(self.actor, 'engine', None)).__name__} does not expose optimizer_config.clip_grad; "
+                "per-step grad_clip_norm is unsupported for this actor strategy"
+            )
+        previous = optimizer_config.clip_grad
+        optimizer_config.clip_grad = clip_grad
+        try:
+            return self.actor.optimizer_step(optim_step_params=optim_step_params)
+        finally:
+            optimizer_config.clip_grad = previous
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_optimizer_state(self):
+        """Fresh optimizer state after a weights-only load.
+
+        A VeRL checkpoint restores parameters and optimizer state together, but
+        Tinker's ``create_training_client_from_state`` (``load_weights`` with
+        ``optimizer=false``) must continue from the saved weights with a new
+        optimizer. Clearing the torch optimizer's per-parameter state (Adam
+        moments and step counts) makes the next step a first step; parameters
+        and hyperparameters are unchanged. Gradients are cleared as well.
+        """
+        assert "actor" in self.role, "reset_optimizer_state only supports the actor role"
+        optimizer = getattr(getattr(self.actor, "engine", None), "optimizer", None)
+        if optimizer is None or not hasattr(optimizer, "state"):
+            raise NotImplementedError(
+                f"{type(getattr(self.actor, 'engine', None)).__name__} does not expose a torch optimizer; "
+                "weights-only checkpoint loads are unsupported for this actor strategy"
+            )
+        optimizer.state.clear()
+        optimizer.zero_grad()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def prepare_actor_for_weight_sync(self):
@@ -607,9 +673,20 @@ class ColocatedBackend:
                 if should_profile:
                     self._stop_profile(profile_step)
 
-    def optim_step(self, optim_step_params: dict[str, Any] | None = None):
+    def optim_step(self, optim_step_params: dict[str, Any] | None = None, grad_clip_norm: float | None = None):
+        """One optimizer step.
+
+        ``grad_clip_norm`` follows Tinker ``AdamParams``: ``> 0`` clips the
+        global grad norm to that value, ``0`` disables clipping, ``None`` keeps
+        the server-start ``actor.optim.clip_grad``.
+        """
         with self._engine_lock:
             self._prepare_model_roles({ModelRole.ACTOR}, reason="optim_step")
+            if grad_clip_norm is not None:
+                return self.actor_rollout_wg.optimizer_step_with_grad_clip(
+                    optim_step_params=optim_step_params,
+                    grad_clip_norm=grad_clip_norm,
+                )
             if optim_step_params is None:
                 return self.actor_rollout_wg.optimizer_step()
             return self.actor_rollout_wg.optimizer_step(optim_step_params=optim_step_params)
@@ -651,4 +728,6 @@ class ColocatedBackend:
             self._prepare_model_roles({ModelRole.ACTOR}, reason="load_checkpoint")
             self.actor_rollout_wg.load_checkpoint(checkpoint_path)
             if zero_optimizer_grad:
-                self.actor_rollout_wg.optimizer_zero_grad()
+                # Weights-only load (Tinker create_training_client_from_state): the VeRL
+                # checkpoint also restored the optimizer moments, so start a fresh optimizer.
+                self.actor_rollout_wg.reset_optimizer_state()
