@@ -112,6 +112,27 @@ class TinkerServerActorRolloutRefWorker(TinkerActorRolloutRefWorker):
             optimizer_config.clip_grad = previous
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_optimizer_state(self):
+        """Fresh optimizer state after a weights-only load.
+
+        A VeRL checkpoint restores parameters and optimizer state together, but
+        Tinker's ``create_training_client_from_state`` (``load_weights`` with
+        ``optimizer=false``) must continue from the saved weights with a new
+        optimizer. Clearing the torch optimizer's per-parameter state (Adam
+        moments and step counts) makes the next step a first step; parameters
+        and hyperparameters are unchanged. Gradients are cleared as well.
+        """
+        assert "actor" in self.role, "reset_optimizer_state only supports the actor role"
+        optimizer = getattr(getattr(self.actor, "engine", None), "optimizer", None)
+        if optimizer is None or not hasattr(optimizer, "state"):
+            raise NotImplementedError(
+                f"{type(getattr(self.actor, 'engine', None)).__name__} does not expose a torch optimizer; "
+                "weights-only checkpoint loads are unsupported for this actor strategy"
+            )
+        optimizer.state.clear()
+        optimizer.zero_grad()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def prepare_actor_for_weight_sync(self):
         """Release actor training-only memory before waking rollout weights.
 
@@ -707,4 +728,6 @@ class ColocatedBackend:
             self._prepare_model_roles({ModelRole.ACTOR}, reason="load_checkpoint")
             self.actor_rollout_wg.load_checkpoint(checkpoint_path)
             if zero_optimizer_grad:
-                self.actor_rollout_wg.optimizer_zero_grad()
+                # Weights-only load (Tinker create_training_client_from_state): the VeRL
+                # checkpoint also restored the optimizer moments, so start a fresh optimizer.
+                self.actor_rollout_wg.reset_optimizer_state()

@@ -254,3 +254,12 @@ Changed: `src/verl_tinker/tinker_router.py`, `src/verl_tinker/tinker_ops.py`,
   clipped step vs lr/10 reference 0.6-0.7 (bf16 noise floor) vs 28-35 for
   the unclipped step; top-k rows 5 wide; prompt_logprobs with
   topk_prompt_logprobs identical to the compute_logprobs request.
+
+## Weights-only checkpoint loads reset the optimizer
+
+`load_weights` with `optimizer=false` (Tinker `create_training_client_from_state`) used to load the VeRL
+checkpoint — parameters **and** optimizer state — and only clear gradients, so the restored Adam moments
+silently carried over (found by the EnvLoop prod e2e: steps after a weights-only and a with-optimizer
+resume differed by 2.6e-3 instead of ~0.1 on Tinker). The backend now calls the new worker method
+`reset_optimizer_state`, which clears the torch optimizer's per-parameter state and gradients, so the next
+step is a first step from the saved weights. `optimizer=true` is unchanged.

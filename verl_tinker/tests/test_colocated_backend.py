@@ -676,13 +676,13 @@ class TestReplicaLifecycle:
         assert backend.actor_rollout_wg.optim_step_params == optim_step_params
 
     def test_load_checkpoint_can_zero_optimizer_grad_after_load(self):
-        """optimizer=false loads the checkpoint then clears optimizer gradients."""
+        """optimizer=false loads the checkpoint then resets the restored optimizer state."""
         backend = self._make_lifecycle_backend()
 
         backend.load_checkpoint("/tmp/checkpoint", zero_optimizer_grad=True)
 
         backend.actor_rollout_wg.load_checkpoint.assert_called_once_with("/tmp/checkpoint")
-        backend.actor_rollout_wg.optimizer_zero_grad.assert_called_once_with()
+        backend.actor_rollout_wg.reset_optimizer_state.assert_called_once_with()
 
     def test_load_checkpoint_keeps_loaded_optimizer_grad_by_default(self):
         """Default load_checkpoint preserves the loaded optimizer state as-is."""
@@ -692,6 +692,7 @@ class TestReplicaLifecycle:
 
         backend.actor_rollout_wg.load_checkpoint.assert_called_once_with("/tmp/checkpoint")
         backend.actor_rollout_wg.optimizer_zero_grad.assert_not_called()
+        backend.actor_rollout_wg.reset_optimizer_state.assert_not_called()
 
     def test_sleep_is_idempotent(self):
         """Multiple training ops don't re-sleep already-slept replicas."""
@@ -1028,3 +1029,40 @@ def test_backend_optim_step_routes_grad_clip_norm_to_worker_override():
 
     backend.optim_step({"lr": 1e-5})
     backend.actor_rollout_wg.optimizer_step.assert_called_once_with(optim_step_params={"lr": 1e-5})
+
+
+def test_reset_optimizer_state_makes_the_next_adam_step_a_first_step():
+    """Weights-only load: restored Adam moments are discarded, parameters are kept."""
+    from types import SimpleNamespace
+
+    def make():
+        torch.manual_seed(0)
+        module = torch.nn.Linear(3, 2)
+        return module, torch.optim.AdamW(module.parameters(), lr=0.1, weight_decay=0.0)
+
+    def step(module, optimizer, scale):
+        optimizer.zero_grad()
+        (module(torch.ones(1, 3)).sum() * scale).backward()
+        optimizer.step()
+
+    # Restored path: one step of history, then a second step.
+    module, optimizer = make()
+    step(module, optimizer, 1.0)
+    assert optimizer.state
+    snapshot = [p.detach().clone() for p in module.parameters()]
+    worker = _grad_clip_worker(SimpleNamespace(optimizer=optimizer))
+    worker.reset_optimizer_state()
+    assert not optimizer.state
+    assert all(torch.equal(a, b) for a, b in zip(snapshot, module.parameters(), strict=True))
+    step(module, optimizer, 5.0)
+    after_reset = [p.detach().clone() for p in module.parameters()]
+
+    # Reference: a brand-new optimizer from the same weights takes the same step.
+    fresh_module, _ = make()
+    with torch.no_grad():
+        for target, source in zip(fresh_module.parameters(), snapshot, strict=True):
+            target.copy_(source)
+    fresh_optimizer = torch.optim.AdamW(fresh_module.parameters(), lr=0.1, weight_decay=0.0)
+    step(fresh_module, fresh_optimizer, 5.0)
+    for a, b in zip(after_reset, fresh_module.parameters(), strict=True):
+        torch.testing.assert_close(a, b.detach())
