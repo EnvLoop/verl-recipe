@@ -61,18 +61,21 @@ called from `backends/_loss.py`) with token-sum reduction scaled by `dp_size`
   Tensors must have length `len(model_input)` and 1-D `target_tokens` must be
   the shift-by-one of `model_input` (the backend scores the next token of the
   sequence; a mismatch would be silently mis-scored).
-* Positions evaluated by RL losses: `advantage != 0 or logprob != 0 (or
-  sequence_ratio_mask != 0)`. For IS/PPO/CISPO/GSPO this equals Tinker's
-  full-sequence sum. For DRO the quadratic penalty is not applied on Tinker's
-  prompt padding (`logprobs == advantages == 0`) — a deliberate, documented
-  deviation from a literal full-sequence reading of the DRO snippet.
-* A datum with no evaluated position contributes zero loss (Tinker) instead of
-  the upstream 422 "no inferrable response window".
+* RL losses are summed over **every** target position, like real Tinker
+  (confirmed by the EnvLoop e2e against Tinker: `loss:sum` equals the doc
+  formula summed over all tokens on the returned learner logprobs). For
+  IS/PPO/CISPO/GSPO zero-advantage positions contribute nothing; DRO's
+  `0.5 * beta * (lp - q) ** 2` also applies on prompt positions whose sampling
+  logprob is padded with 0 (upstream only scored an inferred response window).
+  A datum with all-zero advantages is accepted (upstream: 422 "no inferrable
+  response window").
 * All validation runs synchronously in the router: `/api/v1/forward_backward`
   and `/api/v1/forward` return HTTP 422 with a client-facing message before
   anything is scheduled (upstream surfaced most of these as failed futures).
 * Metrics: `loss:sum` for every loss (Tinker name); gspo adds its two
-  documented metrics. The VeRL-internal `actor/pg_loss`, `actor/pg_clipfrac`,
+  documented metrics. Tinker's undocumented extras (PPO
+  `ppo_clipped_fraction`/`ppo_kl_div`/`ppo_mean_ratio`, `clock_cycle:unique`)
+  are not emitted. The VeRL-internal `actor/pg_loss`, `actor/pg_clipfrac`,
   `actor/ppo_kl`, `rollout_corr/*` metrics are no longer emitted for Tinker
   losses (still emitted for `custom_from_config`); VeRL perf metrics remain.
 * `cross_entropy` weights may be any float incl. negative (the SDK's
@@ -103,7 +106,9 @@ called from `backends/_loss.py`) with token-sum reduction scaled by `dp_size`
   was ignored. Now clients get exactly what they ask for; a request without
   any optimizer params keeps the startup `clip_grad`.
 * The optim_step result carries the pre-clip global norm as
-  `metrics["grad_norm:mean"]` (Tinker's `OptimStepResponse.metrics`). The
+  `metrics["unclipped_grad_l2:mean"]` (Tinker's name) and, as before,
+  `metrics["grad_norm:mean"]`. An optim_step without gradients leaves the
+  weights unchanged (AdamW skips parameters with no gradient). The
   "accepted but not used" warning is removed.
 * Dimuon params (`optimizer_params`, SDK 0.30) and a `create_model`
   `optimizer_config` other than AdamW are rejected with HTTP 400
@@ -120,7 +125,11 @@ called from `backends/_loss.py`) with token-sum reduction scaled by `dp_size`
   change, so the candidates come from one extra teacher-forced
   `prompt_logprobs=k` pass over `prompt + completion` on the same rollout
   weights (one extra prefill per sequence, only when k > 0). When the
-  completion filled the context window the last position is `null`.
+  completion filled the context window the last position is `null`. Each row
+  has exactly k entries, sorted. When the sampling distribution is the
+  model's own (temperature 1, top_p 1, no top_k), the sampled token's entry is
+  set to its sampled logprob so the two agree exactly, as on Tinker (they come
+  from the same pass there); the other entries carry the scoring-pass values.
   `k > server.max_topk_logprobs` (default 20 = vLLM `max_logprobs`) → HTTP
   400 `TOPK_SAMPLE_LOGPROBS_TOO_LARGE`; `k < 0` → 422.
 * `target_prompt_logprobs` (SDK 0.30) is **not feasible** on the vLLM rollout
@@ -177,7 +186,7 @@ called from `backends/_loss.py`) with token-sum reduction scaled by `dp_size`
   → future `{"type": "forward_backward", "loss_fn_output_type", "loss_fn_outputs": [{"logprobs": TensorData}], "metrics"}`.
 * `POST /api/v1/forward_backward`: losses `cross_entropy | importance_sampling | ppo | cispo | dro | gspo | custom_from_config`; sync 422 on contract violations.
 * `POST /api/v1/asample`: accepts `topk_sample_logprobs`, `record_stability_info`; `target_prompt_logprobs` → 400 typed; sequences may carry `topk_logprobs`.
-* `POST /api/v1/optim_step`: `adam_params.grad_clip_norm` honoured; `metrics["grad_norm:mean"]` = pre-clip norm.
+* `POST /api/v1/optim_step`: `adam_params.grad_clip_norm` honoured; `metrics["unclipped_grad_l2:mean"]` (= `grad_norm:mean`) = pre-clip norm.
 * `POST /api/v1/create_model`: 409 on rank mismatch; accepts SDK 0.30 `optimizer_config` (AdamW only).
 * Typed 4xx errors use `HTTPException(detail={"code", "message"})`.
 

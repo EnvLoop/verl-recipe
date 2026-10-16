@@ -162,25 +162,26 @@ def tensor_data_to_torch(td: Any) -> torch.Tensor:
     return t
 
 
-def rl_token_mask(
-    sampling_logprobs: torch.Tensor,
-    advantages: torch.Tensor,
-    sequence_ratio_mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Positions an RL loss is evaluated on (target-indexed, bool).
+def sampled_token_mask(sampling_logprobs: torch.Tensor, advantages: torch.Tensor) -> torch.Tensor:
+    """Sampled-completion positions of a Tinker RL datum (target-indexed, bool).
 
-    Tinker's RL datums pad prompt positions with ``logprobs=0`` and
-    ``advantages=0``; a position contributes to IS / PPO / CISPO / GSPO only
-    through a nonzero advantage, so evaluating the loss on
-    ``advantage != 0 or logprob != 0 (or sequence_ratio_mask != 0)`` is
-    equivalent to Tinker's full-sequence sum for those losses. For DRO the
-    quadratic penalty is applied on the same positions (prompt padding with
-    ``logprobs == 0`` and ``advantages == 0`` is excluded).
+    Tinker RL datums pad prompt positions with ``logprobs=0`` and
+    ``advantages=0``. Used as GSPO's ``sequence_ratio_mask`` when the client
+    does not send one.
     """
-    mask = (advantages != 0) | (sampling_logprobs != 0)
-    if sequence_ratio_mask is not None:
-        mask = mask | (sequence_ratio_mask != 0)
-    return mask
+    return (advantages != 0) | (sampling_logprobs != 0)
+
+
+def rl_loss_mask(target_len: int) -> torch.Tensor:
+    """Positions every Tinker RL loss is summed over: all ``N`` target positions.
+
+    Matches real Tinker, which evaluates the documented formula on every
+    position: zero-advantage positions contribute nothing to IS / PPO / CISPO /
+    GSPO, but DRO's ``0.5 * beta * (lp - q) ** 2`` also applies on prompt
+    positions whose sampling logprob is padded with 0 (confirmed against
+    Tinker by the EnvLoop e2e).
+    """
+    return torch.ones(target_len, dtype=torch.bool)
 
 
 def validate_loss_fn_inputs(loss_name: str, datums: Sequence[Any], *, forward_only: bool = False) -> None:
@@ -381,9 +382,9 @@ def loss_metrics_from_logprobs(
         q = inputs["logprobs"].to(torch.float32)
         adv = inputs["advantages"].to(torch.float32)
         srm = inputs.get("sequence_ratio_mask")
-        mask = rl_token_mask(q, adv, srm)
+        mask = rl_loss_mask(lp.numel())
         if name == "gspo" and srm is None:
-            srm = mask.to(torch.float32)
+            srm = sampled_token_mask(q, adv).to(torch.float32)
         out = rl_token_losses(spec, target_logprobs=lp, sampling_logprobs=q, advantages=adv, sequence_ratio_mask=srm)
         total += float(masked_loss_mat(out.loss_mat, mask).sum().item())
         if name == "gspo" and bool(out.seq_has_ratio[0]):

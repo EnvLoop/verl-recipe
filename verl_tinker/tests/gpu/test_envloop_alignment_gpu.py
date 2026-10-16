@@ -316,14 +316,16 @@ def test_forward_matches_forward_backward_and_has_no_grad_side_effects(head, mod
     # Gradients accumulated by forward_backward survive forward() calls.
     _forward(head, model, datum)
     _forward(head, model, datum)
-    with_forwards = _optim(head, model, lr=0.0)["metrics"]["grad_norm:mean"]
+    with_forwards = _optim(head, model, lr=0.0)["metrics"]["unclipped_grad_l2:mean"]
     _forward_backward(head, model, datum)
-    control = _optim(head, model, lr=0.0)["metrics"]["grad_norm:mean"]
+    control = _optim(head, model, lr=0.0)["metrics"]["unclipped_grad_l2:mean"]
     assert with_forwards > 0
     assert with_forwards == pytest.approx(control, rel=TOL)
-    # optim_step consumed the gradients: a forward alone does not create new ones.
-    _forward(head, model, datum)
-    assert _optim(head, model, lr=0.0)["metrics"].get("grad_norm:mean", 0.0) == pytest.approx(0.0, abs=1e-8)
+    # optim_step consumed the gradients: a forward alone does not create new ones,
+    # and a step without gradients leaves the weights bit-identical (Tinker e2e).
+    before = _logprobs(_forward(head, model, datum))
+    assert _optim(head, model, lr=1e-3)["metrics"].get("unclipped_grad_l2:mean", 0.0) == pytest.approx(0.0, abs=1e-8)
+    assert torch.equal(_logprobs(_forward(head, model, datum)), before)
 
 
 def _rl_datum(sampling_logprobs, advantages, ratio_mask=None):
@@ -391,7 +393,7 @@ def test_grad_clip_norm_scales_the_update(head, model):
     before = _logprobs(_forward(head, model, probe))
 
     _forward_backward(head, model, datum)
-    norm = _optim(head, model, lr=0.0)["metrics"]["grad_norm:mean"]
+    norm = _optim(head, model, lr=0.0)["metrics"]["unclipped_grad_l2:mean"]
     assert norm > 0 and math.isfinite(norm)
 
     lr = 1e3 / norm  # ||update|| = lr * ||g|| / eps = 1e-3 without clipping: small, first-order regime
@@ -400,7 +402,7 @@ def test_grad_clip_norm_scales_the_update(head, model):
         head.call("/api/v1/load_weights", {"model_id": model["model_id"], "path": base, "optimizer": True})
         _forward_backward(head, model, datum)
         step = _optim(head, model, lr=lr, eps=1e6, beta1=0.0, grad_clip_norm=grad_clip_norm)
-        reported = step["metrics"]["grad_norm:mean"]
+        reported = step["metrics"]["unclipped_grad_l2:mean"]
         assert reported == pytest.approx(norm, rel=TOL)  # pre-clip norm, whatever the clip
         return (_logprobs(_forward(head, model, probe)) - before).abs().sum().item()
 
@@ -433,13 +435,13 @@ def test_topk_sample_logprobs_and_target_prompt_logprobs(head, model):
         for token, logprob, row in zip(sequence["tokens"], sequence["logprobs"], rows, strict=True):
             if row is None:
                 continue
-            assert 1 <= len(row) <= 5
+            assert len(row) == 5
             values = [lp for _, lp in row]
             assert values == sorted(values, reverse=True)
             for candidate, candidate_lp in row:
                 if candidate == token:
                     matched += 1
-                    assert candidate_lp == pytest.approx(logprob, abs=0.1)
+                    assert candidate_lp == logprob  # T=1: pinned to the sampled logprob, as on Tinker
     assert matched > 0
 
     rejected = head.post(

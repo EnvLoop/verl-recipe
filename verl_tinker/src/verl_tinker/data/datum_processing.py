@@ -4,7 +4,7 @@ import torch
 from fastapi import HTTPException
 from tensordict import TensorDict
 
-from ..tinker_losses import TINKER_RL_LOSSES, rl_token_mask, tensor_data_to_torch
+from ..tinker_losses import TINKER_RL_LOSSES, rl_loss_mask, sampled_token_mask, tensor_data_to_torch
 
 # ============================================================
 # Datum → TensorDict translation (inverse of data_converter.py)
@@ -176,11 +176,11 @@ def _datums_to_update_actor_td(
 
     For Tinker's RL losses (``loss_name`` in ``TINKER_RL_LOSSES``) the wire
     carries exactly ``target_tokens`` / ``logprobs`` / ``advantages`` (+
-    ``sequence_ratio_mask`` for ``gspo``), so the evaluated positions are
-    ``advantage != 0 or logprob != 0 (or sequence_ratio_mask != 0)``. A datum
-    with no such position contributes zero loss (as on Tinker) instead of
-    being rejected. ``gspo`` additionally gets a rectangular
-    ``sequence_ratio_mask`` (defaulting to the evaluated positions).
+    ``sequence_ratio_mask`` for ``gspo``) and, like Tinker, the loss is summed
+    over every target position: the response window is the whole sequence
+    after its first token (VeRL needs a non-empty prompt). ``gspo``
+    additionally gets a rectangular ``sequence_ratio_mask`` (defaulting to the
+    sampled-completion positions, ``logprob != 0 or advantage != 0``).
     """
     tinker_rl = loss_name in TINKER_RL_LOSSES
     gspo = loss_name == "gspo"
@@ -225,8 +225,10 @@ def _datums_to_update_actor_td(
         padded_ratio_mask = None
         if gspo and "sequence_ratio_mask" in loss_inputs:
             padded_ratio_mask = (_tensor_data_to_torch(loss_inputs["sequence_ratio_mask"]) != 0).float()
+        if gspo and padded_ratio_mask is None:
+            padded_ratio_mask = sampled_token_mask(padded_logp, padded_adv).float()
         if tinker_rl:
-            padded_mask = rl_token_mask(padded_logp, padded_adv, padded_ratio_mask).float()
+            padded_mask = rl_loss_mask(padded_adv.numel()).float()
         elif "response_mask" in loss_inputs:
             padded_mask = _tensor_data_to_torch(loss_inputs["response_mask"]).float()
         elif "mask" in loss_inputs:
@@ -241,10 +243,6 @@ def _datums_to_update_actor_td(
 
         # Read response window from the explicit mask (target-indexed).
         mask_positions = (padded_mask > 0).nonzero(as_tuple=True)[0]
-        if mask_positions.numel() == 0 and tinker_rl:
-            # Zero-loss datum: keep a one-token, fully masked response window so
-            # the rmpad / token-accounting invariants still hold.
-            mask_positions = torch.tensor([padded_mask.numel() - 1])
         if mask_positions.numel() == 0:
             raise HTTPException(
                 status_code=422,
@@ -278,9 +276,8 @@ def _datums_to_update_actor_td(
         advantages = padded_adv[response_start_in_target : response_start_in_target + response_len]
         resp_mask = padded_mask[response_start_in_target : response_start_in_target + response_len]
         if gspo:
-            ratio_source = padded_ratio_mask if padded_ratio_mask is not None else padded_mask
             per_sample_ratio_mask.append(
-                ratio_source[response_start_in_target : response_start_in_target + response_len].float()
+                padded_ratio_mask[response_start_in_target : response_start_in_target + response_len].float()
             )
 
         # Optional client-supplied importance-sampling correction. verl's

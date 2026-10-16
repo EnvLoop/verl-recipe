@@ -394,6 +394,7 @@ async def test_optim_step_merges_one_to_all_worker_metrics(monkeypatch):
         "type": "optim_step",
         "metrics": {
             "grad_norm:mean": 2.0,
+            "unclipped_grad_l2:mean": 2.0,
             "lr:mean": 1e-5,
         },
     }

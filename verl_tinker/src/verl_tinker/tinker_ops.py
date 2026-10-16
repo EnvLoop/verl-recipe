@@ -231,6 +231,35 @@ async def _sampled_topk_logprobs(
     return _topk_rows_or_none(selected)
 
 
+def _sampling_is_unmodified(sampling_params: dict[str, Any]) -> bool:
+    """True when the sampling distribution is the model's own (T=1, no top-p / top-k truncation)."""
+    return (
+        float(sampling_params.get("temperature", 1.0)) == 1.0
+        and float(sampling_params.get("top_p", 1.0)) >= 1.0
+        and int(sampling_params.get("top_k", -1)) <= 0
+    )
+
+
+def _pin_sampled_entries(rows, tokens, logprobs):
+    """Make each sampled token's top-k entry carry exactly its sampled logprob.
+
+    On Tinker both come from the same forward pass, so they are equal. Here the
+    top-k rows come from a separate scoring pass on the same weights and differ
+    by kernel/batching noise; the sampled-token entry is set to the sampling
+    pass value (which is what RL uses as ``q``) and the row is re-sorted.
+    """
+    if logprobs is None:
+        return rows
+    pinned = []
+    for token, logprob, row in zip(tokens, logprobs, rows, strict=True):
+        if row is None or logprob is None:
+            pinned.append(row)
+            continue
+        row = [(tid, float(logprob)) if tid == token else (tid, lp) for tid, lp in row]
+        pinned.append(sorted(row, key=lambda entry: entry[1], reverse=True))
+    return pinned
+
+
 def _normalize_tinker_stop_reason(stop_reason: Any) -> str:
     """Map rollout backend stop reasons to Tinker's public StopReason literals."""
     if stop_reason in (None, "stop", "completed"):
@@ -420,9 +449,13 @@ async def optim_step(engine, adam_params=None) -> dict:
         metrics = await asyncio.to_thread(engine.optim_step, optim_step_params)
     else:
         metrics = await asyncio.to_thread(engine.optim_step, optim_step_params, grad_clip_norm=grad_clip_norm)
+    metrics = _coerce_verl_metrics_to_floats(_merge_worker_metric_dicts(metrics) or {})
+    if "grad_norm:mean" in metrics:
+        # Tinker's name for the pre-clip global gradient norm.
+        metrics["unclipped_grad_l2:mean"] = metrics["grad_norm:mean"]
     return {
         "type": "optim_step",
-        "metrics": _coerce_verl_metrics_to_floats(_merge_worker_metric_dicts(metrics) or {}),
+        "metrics": metrics,
     }
 
 
@@ -581,7 +614,10 @@ async def sample(engine, req) -> dict:
                 for sequence in sequences
             ]
         )
+        pin = _sampling_is_unmodified(sampling_params)
         for sequence, rows in zip(sequences, topk_rows, strict=True):
+            if pin:
+                rows = _pin_sampled_entries(rows, sequence["tokens"], sequence["logprobs"])
             sequence["topk_logprobs"] = rows
 
     extras = getattr(results[0], "extra_fields", None) or {}

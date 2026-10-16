@@ -212,10 +212,9 @@ def test_rl_losses_match_tinker_reference_value_and_gradient(spec):
         elif spec["name"] == "cispo":
             ref = ref_cispo(leaf, s, a, spec["clip_low_threshold"], spec["clip_high_threshold"])
         else:
-            # DRO's quadratic term is evaluated on the RL positions (advantage or
-            # sampling logprob nonzero); Tinker-style prompt padding is excluded.
-            evaluated = (a != 0) | (s != 0)
-            ref = ref_dro(leaf[evaluated], s[evaluated], a[evaluated], spec["beta"])
+            # Literal full-sequence sum, as real Tinker does: the quadratic
+            # penalty also applies on prompt positions padded with logprobs=0.
+            ref = ref_dro(leaf, s, a, spec["beta"])
         ref.backward()
         ref_total = ref_total + ref.detach()
         torch.testing.assert_close(grad[:-1], leaf.grad, rtol=1e-5, atol=1e-6)
@@ -299,6 +298,19 @@ def test_gspo_ratio_mask_controls_sequence_ratio_not_loss_positions():
     ref.backward()
     assert loss.item() == pytest.approx(ref.item(), rel=1e-5)
     torch.testing.assert_close(grads[0][:-1], leaf.grad, rtol=1e-5, atol=1e-6)
+
+
+def test_dro_penalizes_prompt_positions_like_tinker():
+    """Real Tinker (EnvLoop e2e): DRO's 0.5*beta*(lp - q)^2 applies at every position, prompt included."""
+    datum, t, s, a, ratio_mask = _rl_case(25, 6, 3)
+    loss, _, grads = _run_server_rl_loss(normalize_loss_spec("dro", {"beta": 0.5}), [datum], [t], pad_to_multiple=1)
+    completion = ratio_mask != 0
+    completion_only = ref_dro(t[completion], s[completion], a[completion], 0.5).item()
+    full = ref_dro(t, s, a, 0.5).item()
+    assert loss.item() == pytest.approx(full, rel=1e-5)
+    assert full > completion_only
+    prompt_grad = grads[0][: int((~completion).sum())]
+    torch.testing.assert_close(prompt_grad, 0.5 * t[~completion], rtol=1e-5, atol=1e-6)
 
 
 def test_rl_datum_without_evaluated_positions_contributes_zero_loss():
@@ -610,6 +622,30 @@ async def test_topk_sample_logprobs_are_aligned_with_sampled_positions():
     assert scoring[0][0] == prompt + completion
     assert scoring[0][1]["prompt_logprobs"] == 3 and scoring[0][1]["max_tokens"] == 1
     assert scoring[0][1]["temperature"] == pytest.approx(0.7)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("temperature", "pinned"), [(1.0, True), (0.7, False)])
+async def test_sampled_token_topk_entry_equals_sampled_logprob_when_unmodified(temperature, pinned):
+    prompt = [11, 12, 13]
+    position = len(prompt)  # first sampled token's full-sequence position
+    sampled_token = 1000 * position + 1  # rank-2 candidate of the scoring pass
+    engine = _SamplingEngine([sampled_token], k=3)
+    req = _sample_req(prompt, k=3)
+    req.sampling_params.temperature = temperature
+    req.sampling_params.top_p = 1.0
+
+    result = await sample(engine, req)
+
+    sequence = result["sequences"][0]
+    row = sequence["topk_logprobs"][0]
+    assert len(row) == 3
+    assert [lp for _, lp in row] == sorted((lp for _, lp in row), reverse=True)
+    entry = dict(row)[sampled_token]
+    if pinned:
+        assert entry == sequence["logprobs"][0]  # exactly, like Tinker's single-pass result
+    else:
+        assert entry == pytest.approx(-(position + 0.1))  # scoring-pass value, not mixed with processed logprobs
 
 
 @pytest.mark.asyncio
