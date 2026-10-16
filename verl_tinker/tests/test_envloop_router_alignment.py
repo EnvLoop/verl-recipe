@@ -222,6 +222,28 @@ def test_configured_lora_info_variants():
     )
     info = configured_lora_info(envloop_yaml)
     assert (info.rank, info.alpha, info.train_attn, info.train_mlp, info.train_unembed) == (8, 16.0, True, True, False)
+    # auto_merge_verl_default_config adds VeRL's Megatron-style ``model.lora`` defaults
+    # (rank 0) next to the FSDP keys: alpha / target_modules must follow the rank's source.
+    merged = OmegaConf.merge(
+        {
+            "actor_rollout_ref": {
+                "model": {
+                    "lora": {
+                        "rank": 0,
+                        "alpha": 32,
+                        "target_modules": ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+                    }
+                }
+            }
+        },
+        envloop_yaml,
+    )
+    info = configured_lora_info(merged)
+    assert (info.rank, info.alpha, info.train_attn, info.train_mlp, info.train_unembed) == (8, 16.0, True, True, False)
+    megatron = configured_lora_info(
+        {"actor_rollout_ref": {"model": {"lora_rank": 0, "lora": {"rank": 4, "alpha": 8, "target_modules": ["q_proj"]}}}}
+    )
+    assert (megatron.rank, megatron.alpha, megatron.train_attn, megatron.train_mlp) == (4, 8.0, True, False)
     assert configured_lora_info({"actor_rollout_ref": {"model": {"lora": {"rank": 4, "alpha": 8}}}}).rank == 4
     assert configured_lora_info({"actor_rollout_ref": {"model": {"lora_rank": 0}}}).is_lora is False
     assert configured_lora_info(None).is_lora is False

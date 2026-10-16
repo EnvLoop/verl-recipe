@@ -148,19 +148,24 @@ def configured_lora_info(config: Any) -> LoraInfo:
     if not isinstance(model, (DictConfig, Mapping)):
         return FULL_PARAMETER
 
+    # Read alpha / target_modules from the same section that supplies the rank.
+    # With ``server.auto_merge_verl_default_config`` VeRL's defaults always add a
+    # Megatron-style ``model.lora`` dict (``rank: 0``, ``alpha: 32``,
+    # ``target_modules: [linear_qkv, linear_proj, linear_fc1, linear_fc2]``)
+    # next to the FSDP ``model.lora_rank`` / ``lora_alpha`` / ``target_modules``
+    # keys; mixing the two reported alpha 32 and train_attn/train_mlp False for
+    # an FSDP all-linear rank-8 adapter.
     lora = _plain(_get(model, "lora")) or {}
     rank = int(_get(lora, "rank", 0) or 0)
-    if rank <= 0:
+    if rank > 0:
+        alpha = _get(lora, "alpha")
+        target_modules = _plain(_get(lora, "target_modules"))
+    else:
         rank = int(_get(model, "lora_rank", 0) or 0)
+        alpha = _get(model, "lora_alpha")
+        target_modules = _plain(_get(model, "target_modules", "all-linear"))
     if rank <= 0:
         return FULL_PARAMETER
-
-    alpha = _get(lora, "alpha")
-    if alpha is None:
-        alpha = _get(model, "lora_alpha")
-    target_modules = _plain(_get(lora, "target_modules"))
-    if target_modules is None:
-        target_modules = _plain(_get(model, "target_modules", "all-linear"))
     train_attn, train_mlp, train_unembed = train_flags_for_target_modules(target_modules)
     return LoraInfo(
         rank=rank,
