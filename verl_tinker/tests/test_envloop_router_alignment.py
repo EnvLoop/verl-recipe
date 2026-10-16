@@ -240,9 +240,8 @@ def test_configured_lora_info_variants():
     )
     info = configured_lora_info(merged)
     assert (info.rank, info.alpha, info.train_attn, info.train_mlp, info.train_unembed) == (8, 16.0, True, True, False)
-    megatron = configured_lora_info(
-        {"actor_rollout_ref": {"model": {"lora_rank": 0, "lora": {"rank": 4, "alpha": 8, "target_modules": ["q_proj"]}}}}
-    )
+    megatron_lora = {"rank": 4, "alpha": 8, "target_modules": ["q_proj"]}
+    megatron = configured_lora_info({"actor_rollout_ref": {"model": {"lora_rank": 0, "lora": megatron_lora}}})
     assert (megatron.rank, megatron.alpha, megatron.train_attn, megatron.train_mlp) == (4, 8.0, True, False)
     assert configured_lora_info({"actor_rollout_ref": {"model": {"lora": {"rank": 4, "alpha": 8}}}}).rank == 4
     assert configured_lora_info({"actor_rollout_ref": {"model": {"lora_rank": 0}}}).is_lora is False

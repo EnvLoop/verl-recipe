@@ -20,7 +20,8 @@ gateway forwards (no SDK needed). Skipped automatically without CUDA.
 Run on a GPU host from the ``verl_tinker`` directory, inside the recipe venv
 (``/tts/verl_tinker/.venv`` on EnvLoop guests)::
 
-    # a) let the test start a small LoRA server itself (default Qwen/Qwen3-0.6B, rank 8, all local GPUs)
+    # a) let the test start a small LoRA server itself (default Qwen/Qwen3-0.6B, rank 8, all local GPUs,
+    #    FSDP2 actor prepared like EnvLoop's guest; TINKER_ALIGN_STRATEGY=fsdp selects FSDP1)
     TINKER_ALIGN_MODEL=Qwen/Qwen3-0.6B TINKER_ALIGN_LORA_RANK=8 \\
         python -m pytest -q -s tests/gpu/test_envloop_alignment_gpu.py
 
@@ -37,6 +38,15 @@ every Tinker RL loss (incl. gspo + its metrics) equals the Tinker formula
 evaluated on the returned logprobs; grad_clip_norm scales the update as
 expected and grad_norm is the pre-clip norm; topk_sample_logprobs shape and
 consistency with the sampled logprobs; typed 400 for target_prompt_logprobs.
+
+Known pre-existing limitation (not caused by the EnvLoop changes; reproduced on
+upstream ``242c73fc``): with the FSDP1 actor (``strategy: fsdp``) and a model
+with tied input/output embeddings such as Qwen3-0.6B, a ``forward`` issued
+after ``forward_backward`` and before ``optim_step`` fails inside FSDP1
+(``as_params=True type(prim_param)=<class 'torch.Tensor'>``) and the actor is
+unusable afterwards (``Changing shared parameters is not supported yet``).
+FSDP2 (EnvLoop's Qwen3.5-4B profile) is not affected, so the self-started
+server defaults to FSDP2.
 """
 
 from __future__ import annotations
@@ -62,6 +72,7 @@ MODEL = os.environ.get("TINKER_ALIGN_MODEL", "Qwen/Qwen3-0.6B")
 PORT = int(os.environ.get("TINKER_ALIGN_PORT", "18765"))
 READY_TIMEOUT_S = float(os.environ.get("TINKER_ALIGN_READY_TIMEOUT_S", "1800"))
 TOL = float(os.environ.get("TINKER_ALIGN_REL_TOL", "0.02"))
+STRATEGY = os.environ.get("TINKER_ALIGN_STRATEGY", "fsdp2")
 
 _CONFIG_TEMPLATE = """
 server:
@@ -74,7 +85,7 @@ server:
   auto_merge_verl_default_config: true
 actor_rollout_ref:
   actor:
-    strategy: fsdp
+    strategy: {strategy}
     ppo_mini_batch_size: 16
     fsdp_config:
       model_dtype: bfloat16
@@ -89,7 +100,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     gpu_memory_utilization: 0.5
-    layered_summon: true
+    layered_summon: {layered_summon}
   ref:
     enable: false
   model:
@@ -161,6 +172,26 @@ def _wait_ready(head: Head, proc: subprocess.Popen | None):
     raise TimeoutError("verl_tinker server did not become ready")
 
 
+def _prepare_fsdp2_config(path: Path) -> str:
+    """FSDP2 actor config, prepared like EnvLoop's guest ``recipe_server.prepare_config``.
+
+    The server's defaults merge only knows ``fsdp``; merge with it, then select
+    the FSDP2 engine and disable the second merge at startup.
+    """
+    from omegaconf import OmegaConf
+    from verl_tinker.config_utils import process_actor_rollout_ref_config
+
+    config = OmegaConf.load(path)
+    config = process_actor_rollout_ref_config(config)
+    config.actor_rollout_ref.actor.strategy = "fsdp2"
+    config.actor_rollout_ref.actor.fsdp_config.strategy = "fsdp2"
+    config.server.auto_merge_verl_default_config = False
+    OmegaConf.resolve(config)
+    out = path.with_suffix(".fsdp2.yaml")
+    OmegaConf.save(config, out)
+    return str(out)
+
+
 @pytest.fixture(scope="module")
 def head():
     url = os.environ.get("TINKER_ALIGN_SERVER_URL")
@@ -181,8 +212,14 @@ def head():
                 checkpoint_dir=workdir / "checkpoints",
                 rank=LORA_RANK,
                 n_gpus=max(1, torch.cuda.device_count()),
+                strategy="fsdp" if STRATEGY == "fsdp2" else STRATEGY,
+                # FSDP2 LoRA sync needs the base model preloaded in vLLM for layered summon;
+                # EnvLoop runs it with TINKER_ROLLOUT_LAYERED_SUMMON=false.
+                layered_summon="false" if STRATEGY == "fsdp2" else "true",
             )
         )
+        if STRATEGY == "fsdp2":
+            config_path = _prepare_fsdp2_config(Path(config_path))
     log = open(workdir / "server.log", "w")  # noqa: SIM115 - closed in teardown
     proc = subprocess.Popen(
         [sys.executable, "-m", "verl_tinker.start", "--config", config_path], stdout=log, stderr=subprocess.STDOUT
@@ -289,6 +326,7 @@ def _logprobs(result) -> torch.Tensor:
 
 def test_lora_metadata_and_rank_conflict(head, model):
     info = head.post("/api/v1/get_info", {"model_id": model["model_id"]})
+    print(f"get_info: {info}")
     assert info["is_lora"] is True and info["lora_rank"] == LORA_RANK, info
     assert info["train_attn"] is True and info["train_mlp"] is True
     response = head.post(
@@ -302,6 +340,7 @@ def test_lora_metadata_and_rank_conflict(head, model):
         expect_status=409,
     )
     assert "rank" in json.dumps(response)
+    print(f"create_model rank {LORA_RANK * 2}: HTTP 409 {response}")
 
 
 def test_forward_matches_forward_backward_and_has_no_grad_side_effects(head, model):
@@ -319,6 +358,11 @@ def test_forward_matches_forward_backward_and_has_no_grad_side_effects(head, mod
     with_forwards = _optim(head, model, lr=0.0)["metrics"]["unclipped_grad_l2:mean"]
     _forward_backward(head, model, datum)
     control = _optim(head, model, lr=0.0)["metrics"]["unclipped_grad_l2:mean"]
+    print(
+        f"forward: loss:sum fwd={fwd['metrics']['loss:sum']} fb={fb['metrics']['loss:sum']} "
+        f"max|lp_fwd-lp_fb|={(_logprobs(fwd) - _logprobs(fb)).abs().max().item():.3g}; "
+        f"grad_norm after fb+2 forwards={with_forwards} vs fb only={control}"
+    )
     assert with_forwards > 0
     assert with_forwards == pytest.approx(control, rel=TOL)
     # optim_step consumed the gradients: a forward alone does not create new ones,
@@ -376,6 +420,7 @@ def test_rl_loss_sum_matches_tinker_formula_on_returned_logprobs(head, model, lo
             }
 
     expected = loss_metrics_from_logprobs(spec, [_D(datum)], [_logprobs(result).float()])
+    print(f"{loss_fn} {config}: server {result['metrics']} expected {expected}")
     assert result["metrics"]["loss:sum"] == pytest.approx(expected["loss:sum"], rel=TOL, abs=1e-3)
     if loss_fn == "gspo":
         assert result["metrics"][GSPO_LOG_RATIO_METRIC] == pytest.approx(expected[GSPO_LOG_RATIO_METRIC], abs=5e-3)
@@ -386,6 +431,12 @@ def test_grad_clip_norm_scales_the_update(head, model):
     """With beta1=0 and eps >> |g| an AdamW step is lr * g / eps, so clipping is visible in the update.
 
     (A normal Adam step is invariant to gradient scale, which would hide clipping.)
+    Clipping the gradient to 0.1 * ||g|| must therefore give the same update as
+    an unclipped step with lr / 10. The probe logprobs are compared against that
+    reference rather than by magnitude ratio: the bf16 forward has a noise floor
+    (~0.5 summed over the 10 probe tokens on Qwen3-0.6B / H100 once the zero-init
+    LoRA B becomes nonzero), so the update must be well above it (||update|| = 1
+    here; at 1e-3 a 10x smaller update changed the probe just as much).
     """
     datum = _ce()
     probe = _ce([0.0] * N_PREFIX + [1.0] * len(COMPLETION))
@@ -396,21 +447,35 @@ def test_grad_clip_norm_scales_the_update(head, model):
     norm = _optim(head, model, lr=0.0)["metrics"]["unclipped_grad_l2:mean"]
     assert norm > 0 and math.isfinite(norm)
 
-    lr = 1e3 / norm  # ||update|| = lr * ||g|| / eps = 1e-3 without clipping: small, first-order regime
+    lr = 1e6 / norm  # ||update|| = lr * ||g|| / eps = 1 without clipping
 
-    def delta(grad_clip_norm: float) -> float:
+    def delta(step_lr: float, grad_clip_norm: float) -> torch.Tensor:
         head.call("/api/v1/load_weights", {"model_id": model["model_id"], "path": base, "optimizer": True})
+        assert torch.equal(_logprobs(_forward(head, model, probe)), before)  # exact restore
         _forward_backward(head, model, datum)
-        step = _optim(head, model, lr=lr, eps=1e6, beta1=0.0, grad_clip_norm=grad_clip_norm)
+        step = _optim(head, model, lr=step_lr, eps=1e6, beta1=0.0, grad_clip_norm=grad_clip_norm)
         reported = step["metrics"]["unclipped_grad_l2:mean"]
         assert reported == pytest.approx(norm, rel=TOL)  # pre-clip norm, whatever the clip
-        return (_logprobs(_forward(head, model, probe)) - before).abs().sum().item()
+        return _logprobs(_forward(head, model, probe)) - before
 
-    unclipped = delta(0.0)
-    clipped = delta(0.1 * norm)
+    unclipped = delta(lr, 0.0)
+    clipped = delta(lr, 0.1 * norm)
+    reference = delta(lr / 10, 0.0)  # what a 0.1 clip must produce
+    inactive = delta(lr, 10 * norm)  # clip above the norm: no-op
     head.call("/api/v1/load_weights", {"model_id": model["model_id"], "path": base, "optimizer": True})
-    assert unclipped > 0
-    assert 0.03 < clipped / unclipped < 0.3, (clipped, unclipped)
+    summary = {
+        "unclipped": unclipped.abs().sum().item(),
+        "clipped": clipped.abs().sum().item(),
+        "reference_lr_div_10": reference.abs().sum().item(),
+        "clipped_vs_reference": (clipped - reference).abs().sum().item(),
+        "unclipped_vs_reference": (unclipped - reference).abs().sum().item(),
+        "inactive_vs_unclipped": (inactive - unclipped).abs().sum().item(),
+    }
+    print(f"grad_clip_norm: norm={norm} {summary}")
+    assert torch.isfinite(unclipped).all() and summary["unclipped"] > 0
+    assert summary["clipped_vs_reference"] < 0.25 * summary["unclipped_vs_reference"], summary
+    assert summary["inactive_vs_unclipped"] < 0.25 * summary["unclipped_vs_reference"], summary
+    assert summary["clipped"] < 0.5 * summary["unclipped"], summary
 
 
 def test_topk_sample_logprobs_and_target_prompt_logprobs(head, model):
@@ -442,6 +507,15 @@ def test_topk_sample_logprobs_and_target_prompt_logprobs(head, model):
                 if candidate == token:
                     matched += 1
                     assert candidate_lp == logprob  # T=1: pinned to the sampled logprob, as on Tinker
+    print(
+        "topk_sample_logprobs=5: "
+        + "; ".join(
+            f"seq{i}: {len(seq['tokens'])} tokens, {sum(r is not None for r in seq['topk_logprobs'])} rows, "
+            f"row widths {sorted({len(r) for r in seq['topk_logprobs'] if r is not None})}"
+            for i, seq in enumerate(result["sequences"])
+        )
+        + f"; sampled-token entries pinned: {matched}"
+    )
     assert matched > 0
 
     rejected = head.post(
@@ -458,3 +532,42 @@ def test_topk_sample_logprobs_and_target_prompt_logprobs(head, model):
         expect_status=400,
     )
     assert rejected["detail"]["code"] == "TARGET_PROMPT_LOGPROBS_UNSUPPORTED"
+    print(f"target_prompt_logprobs: HTTP 400 {rejected['detail']['code']}")
+
+
+def test_sample_prompt_logprobs_together_with_topk_prompt_logprobs(head, model):
+    """``include_prompt_logprobs`` + ``topk_prompt_logprobs`` returns both fields (Tinker behaviour).
+
+    The scalar ``prompt_logprobs`` must agree with what the SDK's
+    ``compute_logprobs`` request (one sample, ``max_tokens=1``, prompt logprobs
+    only) returns, and every top-k row after the first position has k entries.
+    """
+    saved = head.call(
+        "/api/v1/save_weights_for_sampler",
+        {"model_id": model["model_id"], "path": None, "sampling_session_seq_id": 1},
+    )
+    body = {
+        "sampling_session_id": saved["sampling_session_id"],
+        "seq_id": 0,
+        "prompt": {"chunks": [{"type": "encoded_text", "tokens": FULL}]},
+        "sampling_params": {"max_tokens": 1, "temperature": 1.0, "top_p": 1.0, "top_k": -1},
+        "num_samples": 1,
+        "prompt_logprobs": True,
+        "topk_prompt_logprobs": 5,
+    }
+    both = head.call("/api/v1/asample", body)
+    compute_logprobs = head.call("/api/v1/asample", {**body, "topk_prompt_logprobs": 0})
+
+    prompt_lp, topk = both["prompt_logprobs"], both["topk_prompt_logprobs"]
+    reference = compute_logprobs["prompt_logprobs"]
+    assert prompt_lp is not None and topk is not None, both
+    assert len(prompt_lp) == len(topk) == len(reference) == len(FULL)
+    assert prompt_lp[0] is None and reference[0] is None
+    widths = sorted({len(row) for row in topk[1:]})
+    diff = (torch.tensor(prompt_lp[1:], dtype=torch.float64) - torch.tensor(reference[1:], dtype=torch.float64)).abs()
+    print(
+        f"prompt_logprobs+topk_prompt_logprobs=5: {len(prompt_lp)} positions, topk widths {widths}, "
+        f"max|prompt_logprobs - compute_logprobs|={diff.max().item():.3g}"
+    )
+    assert widths == [5]
+    assert diff.max().item() < 1e-2

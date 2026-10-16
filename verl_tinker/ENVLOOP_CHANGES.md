@@ -162,7 +162,11 @@ called from `backends/_loss.py`) with token-sum reduction scaled by `dp_size`
 
 * `lora_info.configured_lora_info` reads the adapter the server was started
   with (`actor_rollout_ref.model.lora_rank|lora_alpha|target_modules`, or the
-  `model.lora` dict); EnvLoop sets the rank via `TINKER_LORA_RANK`.
+  `model.lora` dict when its `rank > 0`); EnvLoop sets the rank via
+  `TINKER_LORA_RANK`. Alpha and `target_modules` come from the same section
+  as the rank: VeRL's merged defaults always carry a Megatron-style
+  `model.lora` dict (`rank: 0`, `alpha: 32`, `linear_qkv/...` modules) next to
+  the FSDP keys.
   `train_attn` / `train_mlp` / `train_unembed` are derived from
   `target_modules` (`all-linear` → attn+mlp, no unembed — PEFT never adapts the
   output layer for `all-linear`).
@@ -202,6 +206,15 @@ called from `backends/_loss.py`) with token-sum reduction scaled by `dp_size`
   prompt-logprob semantics, which may differ from the processed sampling
   logprobs (`logprobs_mode=processed_logprobs`).
 * `target_prompt_logprobs`: not implemented (see 4).
+* Pre-existing, not caused by this branch (reproduced on upstream
+  `242c73fc`): with the FSDP1 actor (`strategy: fsdp`) and a tied-embedding
+  model (Qwen3-0.6B, LoRA), `forward` after `forward_backward` and before
+  `optim_step` fails inside FSDP1 (`as_params=True
+  type(prim_param)=<class 'torch.Tensor'>`) and the actor stays broken
+  (`Changing shared parameters is not supported yet`, `optim_step`:
+  `expected to be in states [IDLE] but current state is FORWARD_BACKWARD`).
+  FSDP2 (EnvLoop's Qwen3.5-4B profile, prepared by the guest's
+  `recipe_server.prepare_config`) is not affected.
 
 ## Files
 
@@ -226,4 +239,18 @@ Changed: `src/verl_tinker/tinker_router.py`, `src/verl_tinker/tinker_ops.py`,
   clip tests run VeRL's real `TinkerTrainingWorker.optimizer_step` and
   `FSDPEngine.optimizer_step` on a CPU module.
 * GPU: `tests/gpu/test_envloop_alignment_gpu.py` (skipped without CUDA); see
-  its module docstring for the three ways to point it at a server.
+  its module docstring for the three ways to point it at a server. The
+  self-started server defaults to an FSDP2 actor prepared like EnvLoop's guest
+  (`TINKER_ALIGN_STRATEGY=fsdp` selects FSDP1, see Known limitations).
+  2026-10-16, 1x H100 80GB SXM (Vast, driver 610.57, CUDA 13.0 wheels, vLLM
+  0.26.0 from `uv.lock`), installed with `install_verl.sh --recipe
+  verl_tinker` as on EnvLoop guests: 11/11 with Qwen/Qwen3-0.6B LoRA rank 8
+  (self-started, FSDP2) and 11/11 with Qwen/Qwen3.5-4B LoRA rank 16 through
+  EnvLoop's `trainingmaster-actor-rollout.yaml` + production env (FSDP2,
+  rollout TP 1 / 0.4); CPU suite 253 passed on the same box. Every RL
+  `loss:sum` matched the formula on the returned logprobs to float precision;
+  forward vs forward_backward logprobs identical and the grad norm after
+  forward_backward + 2 forwards equal to the forward_backward-only norm;
+  clipped step vs lr/10 reference 0.6-0.7 (bf16 noise floor) vs 28-35 for
+  the unclipped step; top-k rows 5 wide; prompt_logprobs with
+  topk_prompt_logprobs identical to the compute_logprobs request.
