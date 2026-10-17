@@ -493,3 +493,41 @@ def test_fsdp1_optimizer_state_round_trips_through_flat_rank_views():
         param = torch.empty(view.shape)
         torch.testing.assert_close(_local_state_value(full, param, 2, rank), view)
     assert _full_state_value([torch.tensor(3.0), torch.tensor(3.0)], (5, 3)).item() == 3.0
+
+
+def test_legacy_optimizer_load_maps_verl_whole_model_param_order(tmp_path):
+    """VeRL's optimizer holds every parameter (frozen ones without state); the loader maps indices by the
+    legacy parameter order and restores the converted state into the split model's optimizer."""
+    peft = pytest.importorskip("peft")
+    from verl_tinker.backends.colocated import _load_legacy_optimizer
+    from verl_tinker.lora_split import legacy_split_names
+
+    torch.manual_seed(5)
+    base = _Block()
+    x, target = torch.randn(5, 8), torch.randn(5, 14)
+    targets = ["in_proj_qkv", "out_proj"]
+    legacy = peft.get_peft_model(copy.deepcopy(base), peft.LoraConfig(r=2, lora_alpha=32, target_modules=targets))
+    legacy_opt = torch.optim.AdamW(list(legacy.parameters()), lr=1e-2)  # all parameters, like VeRL
+    legacy_opt.zero_grad()
+    out_proj = legacy.base_model.model.linear_attn.out_proj
+    (((legacy(x) - target) ** 2).sum() + out_proj(torch.randn(5, 6)).sum()).backward()
+    legacy_opt.step()
+    torch.save(legacy_opt.state_dict(), tmp_path / "optim_world_size_1_rank_0.pt")
+    full = {n: p.detach().clone() for n, p in legacy.named_parameters() if "lora_" in n}
+
+    split = copy.deepcopy(base)
+    mark_split_qkv(split)
+    split = peft.get_peft_model(split, lora_config_class()(r=2, lora_alpha=32, target_modules=targets))
+    split_opt = torch.optim.AdamW(list(split.parameters()), lr=1e-2)
+    manager = SimpleNamespace(world_size=1, rank=0, model=split, optimizer=split_opt)
+    _load_legacy_optimizer(manager, str(tmp_path), full, legacy_split_names(full), lambda key: (4, 4, 6))
+
+    by_name = {n: p for n, p in split.named_parameters()}
+    fused_state = legacy_opt.state[dict(legacy.named_parameters())[
+        "base_model.model.linear_attn.in_proj_qkv.lora_B.default.weight"]]
+    q_state = split_opt.state[by_name["base_model.model.linear_attn.in_proj_qkv.lora_B.default.q.weight"]]
+    torch.testing.assert_close(q_state["exp_avg"], fused_state["exp_avg"][:4])
+    out_state = split_opt.state[by_name["base_model.model.linear_attn.out_proj.lora_A.default.weight"]]
+    torch.testing.assert_close(out_state["exp_avg_sq"], legacy_opt.state[dict(legacy.named_parameters())[
+        "base_model.model.linear_attn.out_proj.lora_A.default.weight"]]["exp_avg_sq"])
+    assert not split_opt.state[by_name["base_model.model.linear_attn.out_proj.base_layer.weight"]]

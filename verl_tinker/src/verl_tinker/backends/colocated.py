@@ -375,7 +375,7 @@ def _load_legacy_optimizer(manager, local_path: str, full_params: dict, names: d
 
     import torch
 
-    from ..lora_split import convert_legacy_optimizer_state
+    from ..lora_split import _SPLIT_PARAM, convert_legacy_optimizer_state
 
     world, rank = manager.world_size, manager.rank
     saved = [
@@ -383,19 +383,34 @@ def _load_legacy_optimizer(manager, local_path: str, full_params: dict, names: d
                    map_location="cpu")
         for r in range(world)
     ]
-    order = [index for group in saved[0]["param_groups"] for index in group["params"]]
-    if len(order) != len(full_params):
-        raise ValueError("optimizer parameters do not line up with the checkpoint's LoRA parameters")
-    full_states = {}
-    for index, (name, tensor) in zip(order, full_params.items(), strict=True):
-        states = [sd["state"].get(index, {}) for sd in saved]
-        full_states[name] = {
-            field: _full_state_value([state[field] for state in states], tensor.shape) for field in states[0]
-        }
-    converted = convert_legacy_optimizer_state(full_states, names, sizes)
-
     def clean(name: str) -> str:
         return name.replace("_fsdp_wrapped_module.", "").replace("_checkpoint_wrapped_module.", "")
+
+    # VeRL's optimizer holds every parameter (frozen ones have no state), in named_parameters order.
+    # The legacy model had the same order with one fused A / B where the split layer has q, k, v.
+    live_names = [clean(n) for n, _ in manager.model.named_parameters()]
+    legacy_names = []
+    for name in live_names:
+        match = _SPLIT_PARAM.match(name)
+        if match is None:
+            legacy_names.append(name)
+        elif match["slice"] == "q":
+            legacy_names.append(f"{match['prefix']}in_proj_qkv.lora_{match['ab']}{match['adapter'] or ''}.weight")
+    order = [index for group in saved[0]["param_groups"] for index in group["params"]]
+    if len(order) != len(legacy_names):
+        raise ValueError("optimizer parameters do not line up with the checkpoint's parameters")
+    full_states = {}
+    for index, name in zip(order, legacy_names, strict=True):
+        states = [sd["state"].get(index) for sd in saved]
+        if not states[0]:
+            continue
+        if name not in full_params:
+            raise ValueError(f"optimizer state for {name} has no LoRA tensor in the checkpoint")
+        full_states[name] = {
+            field: _full_state_value([state[field] for state in states], full_params[name].shape)
+            for field in states[0]
+        }
+    converted = convert_legacy_optimizer_state(full_states, names, sizes)
 
     name_of = {id(p): clean(n) for n, p in manager.model.named_parameters()}
     current = manager.optimizer.state_dict()
