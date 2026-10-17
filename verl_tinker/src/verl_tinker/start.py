@@ -148,6 +148,11 @@ def main() -> None:
     if sys.argv[1] != "--config":
         raise SystemExit(USAGE)
 
+    # Before any vLLM process starts: the rollout needs upstream vLLM fixes (vllm_backports).
+    from .vllm_backports import apply_installed
+
+    apply_installed()
+
     config = load_config(sys.argv[2])
 
     log_config("Received config from user", config)

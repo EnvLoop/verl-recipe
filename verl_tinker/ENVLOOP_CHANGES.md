@@ -468,9 +468,14 @@ end to end (EnvPlatform: `lora_targets.py`, guest overlay; this repo: the pieces
   vLLM 0.26 (this lock) does not for Qwen3.5, and VeRL's in-memory adapter sync
   (`TensorLoRARequest` -> `from_lora_tensors`) does not check expected modules, so the
   rollout **silently dropped** the lm_head LoRA: the sampler sampled from other weights than
-  the actor trained. `vllm_plugin.py` (entry point `vllm.general_plugins`, loaded in every
-  vLLM process) backports vLLM 0.31's `Qwen3_5ForCausalLMBase.embedding_modules`; a vLLM that
-  already declares `lm_head` is left alone.
+  the actor trained. `verl_tinker.start` now applies two upstream vLLM fixes to the installed
+  vLLM before any vLLM process starts (`vllm_backports/`, stdlib applier shared with the EnvLoop
+  sampling pool; idempotent; refuses to start on code it does not recognise):
+  vLLM PR #48850 (`5a4c8d99242e`, in vLLM >= 0.27: Qwen3.5 `embedding_modules`) and vLLM PR
+  #62049 (vllm-project/vllm#51594, open upstream: prompt logprobs and mixed batches map the
+  `lm_head` delta per request instead of per token, so `compute_logprobs` missed a request's own
+  `lm_head` adapter and other requests' adapters leaked in). Both are rebased onto vLLM 0.26.0;
+  a release that already contains a fix simply has no diff for it.
 * Non-power-of-two ranks work in the backend (vLLM zero-pads the adapter into
   `max_lora_rank`, the next value of `MaxLoRARanks`); EnvLoop still only accepts Tinker's
   powers of two.
@@ -486,7 +491,7 @@ EnvLoop guest: EnvPlatform `trainingmaster-actor-rollout.yaml` + `recipe_server.
 | | 16, attn only | 12,386,304 = 16 x 774,144 | 0.0042 | 43,513 |
 | | 24, mlp only (rank padded to vLLM 32) | 27,131,904 = 24 x 1,130,496 | 0.0015 | 34,309 |
 | | 8, unembed only | 2,007,040 = 8 x 250,880 | 0.0028 | 34,313 |
-| | 8, unembed only, **plugin disabled** | same | **1.98** (0% trained tokens sampled: lm_head LoRA dropped) | 42,273 |
+| | 8, unembed only, **without #48850** | same | **1.98** (0% trained tokens sampled: lm_head LoRA dropped) | 42,273 |
 | | 128, all | 275,906,560 = 128 x 2,155,520 | 0.030 | 42,823 |
 | | 256, all (not offered: Tinker max 128) | 551,813,120 | 0.067 (training diverged at lr 1e-3) | 44,309 |
 | Qwen3.8-27B, 2x H200, FSDP1, TP2 / 0.5, layered sync | 8, unembed only | 2,027,520 = 8 x 253,440 | 0.0024 (100% trained tokens) | n/a |
@@ -501,18 +506,18 @@ EnvLoop guest: EnvPlatform `trainingmaster-actor-rollout.yaml` + `recipe_server.
 * Qwen3.8-27B: with the default full-model weight sync (`layered_summon: false`,
   `load_format: dummy`) the first `save_weights_for_sampler` OOMs on 2x H100 **and** 2x H200 (FSDP1
   `summon_full_params` of the whole model while the sleeping vLLM worker keeps ~30 GiB; reproduced
-  with the legacy `all-linear` adapter and without the plugin, and in the EnvLoop prod e2e). This is
+  with the legacy `all-linear` adapter and without #48850, and in the EnvLoop prod e2e). This is
   what "LoRA rollout sync gathers one FSDP unit at a time" above fixes (EnvPlatform's 27B profile
   sets `layered_summon: true` + `load_format: safetensors`). The 27B rows above ran with those two
   settings; the H200 rows on VeRL's own collector (before `_layered_lora_params`, i.e. its
   host-memory fallback), the H100 row on `_layered_lora_params`.
 
-Known limitation outside this repo: vLLM 0.31 (EnvLoop's serving engine) loads a Qwen3.5 `lm_head`
-LoRA from a PEFT adapter but does not apply it (offline `LLM`, V1 and V2 model runners: an
-unembed-only adapter scores exactly like the base model, while HF transformers + PEFT reproduce the
-actor within 0.03). Serving endpoints keep rejecting `lm_head` adapters.
+Correction: an earlier draft said vLLM 0.31 ignores a Qwen3.5 `lm_head` LoRA. It applies it when
+generating; what differed was prompt logprobs, i.e. the #62049 bug above (found by the EnvLoop
+sampling-pool work). The pool applies the same backport; serving endpoints keep rejecting `lm_head`
+adapters until it lands there too.
 
-Files: new `src/verl_tinker/vllm_plugin.py`, `tests/test_envloop_lora_config.py`,
+Files: new `src/verl_tinker/vllm_backports/` (applier + two diffs), `tests/test_envloop_lora_config.py`,
 `tests/gpu/test_envloop_lora_gpu.py`; changed `src/verl_tinker/lora_info.py`,
-`src/verl_tinker/tinker_router.py`, `src/verl_tinker/backends/colocated.py`, `pyproject.toml`
-(entry point only; `uv.lock` unchanged), `tests/test_envloop_router_alignment.py`.
+`src/verl_tinker/tinker_router.py`, `src/verl_tinker/backends/colocated.py`, `src/verl_tinker/start.py`,
+`pyproject.toml` (package data only; `uv.lock` unchanged), `tests/test_envloop_router_alignment.py`.

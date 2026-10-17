@@ -15,16 +15,15 @@
 """Tinker LoraConfig parity on CPU: explicit target modules, seed, reporting, vLLM lm_head plugin."""
 
 import re
-import sys
 from http import HTTPStatus
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
 from fastapi import HTTPException
 from omegaconf import OmegaConf
 from test_envloop_router_alignment import _server
-from verl_tinker import vllm_plugin
+from verl_tinker import vllm_backports
 from verl_tinker.backends.colocated import lora_init_seed
 from verl_tinker.lora_info import configured_lora_info
 
@@ -222,28 +221,31 @@ def test_lora_seed_makes_adapter_init_reproducible_and_restores_rng():
     assert not all(torch.equal(first[key], other[key]) for key in first)
 
 
-def test_vllm_plugin_backports_qwen3_5_lm_head_lora(monkeypatch):
-    class Base:
-        embedding_modules = {}
+def test_vllm_backports_apply_once_and_refuse_foreign_code(tmp_path):
+    """Each shipped diff applies to a tree holding its original code, is idempotent and fails closed."""
+    for fix in vllm_backports.FIXES:
+        diff = vllm_backports.PATCHES / f"{fix}-0.26.0.diff"
+        files = vllm_backports.hunks(diff.read_text())
+        assert files, fix
+        root = tmp_path / fix / "vllm"
+        for relative, file_hunks in files.items():
+            target = root.parent / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# head\n" + "".join(f"{old}# --\n" for old, _ in file_hunks))
+        assert sorted(vllm_backports.apply(root, "0.26.0", fixes=(fix,))) == sorted(files)
+        for relative, file_hunks in files.items():
+            text = (root.parent / relative).read_text()
+            assert all(text.count(new) == 1 for _, new in file_hunks)
+        assert vllm_backports.apply(root, "0.26.0", fixes=(fix,)) == []  # idempotent
+        assert vllm_backports.apply(root, "9.9.9", fixes=(fix,)) == []  # no backport for that release
+        first = next(iter(files))
+        (root.parent / first).write_text("unrelated code\n")
+        with pytest.raises(vllm_backports.BackportError):
+            vllm_backports.apply(root, "0.26.0", fixes=(fix,))
 
-    package = ModuleType("vllm.model_executor.models")
-    qwen3_5 = ModuleType("vllm.model_executor.models.qwen3_5")
-    qwen3_5.Qwen3_5ForCausalLMBase = Base
-    package.qwen3_5 = qwen3_5
-    for name, module in {
-        "vllm": ModuleType("vllm"),
-        "vllm.model_executor": ModuleType("vllm.model_executor"),
-        "vllm.model_executor.models": package,
-        "vllm.model_executor.models.qwen3_5": qwen3_5,
-    }.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    sys.modules["vllm.model_executor"].models = package
 
-    vllm_plugin.register()
-    assert Base.embedding_modules == {"embed_tokens": "input_embeddings", "lm_head": "output_embeddings"}
-
-    # A vLLM that already declares lm_head (0.31+) is left alone.
-    declared = {"lm_head": "output_embeddings"}
-    Base.embedding_modules = declared
-    vllm_plugin.register()
-    assert Base.embedding_modules is declared
+def test_qwen3_5_backport_declares_lm_head_lora():
+    diff = (vllm_backports.PATCHES / "qwen3_5-lm-head-lora-0.26.0.diff").read_text()
+    [(path, [(old, new)])] = vllm_backports.hunks(diff).items()
+    assert path == "vllm/model_executor/models/qwen3_5.py"
+    assert '"lm_head": "output_embeddings"' in new and "embedding_modules" not in old

@@ -40,9 +40,8 @@ dependencies = [
     "kernels==0.14.1",
 ]
 
-[project.entry-points."vllm.general_plugins"]
-# LoRA on the Qwen3.5 lm_head for vLLM < 0.31 (see src/verl_tinker/vllm_plugin.py).
-verl_tinker_qwen3_5_lm_head_lora = "verl_tinker.vllm_plugin:register"
+[tool.setuptools.package-data]
+verl_tinker = ["vllm_backports/*.diff"]
 
 [dependency-groups]
 test = [

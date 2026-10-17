@@ -277,6 +277,36 @@ def test_rollout_samples_from_the_trained_adapter(server, model):
     assert after["mean_abs"] < max(0.05, 3 * before["mean_abs"]), (before, after)
 
 
+def test_prompt_logprobs_match_the_actor(server, model):
+    """compute_logprobs-style request (prompt logprobs on the rollout) agrees with the actor.
+
+    Runs after training, so the adapter (incl. an lm_head LoRA) is far from zero; vLLM without the
+    #62049 backport scores prompt rows with the per-request mapping and misses the lm_head delta.
+    """
+    head = server["head"]
+    saved = head.call(
+        "/api/v1/save_weights_for_sampler",
+        {"model_id": model["model_id"], "path": None, "sampling_session_seq_id": 12},
+    )
+    tokens = PROMPT + COMPLETION
+    result = head.call(
+        "/api/v1/asample",
+        {
+            "sampling_session_id": saved["sampling_session_id"],
+            "seq_id": 0,
+            "prompt": {"chunks": [{"type": "encoded_text", "tokens": tokens}]},
+            "sampling_params": {"max_tokens": 1, "temperature": 1.0, "top_p": 1.0, "top_k": -1},
+            "num_samples": 1,
+            "prompt_logprobs": True,
+        },
+    )
+    sampler = torch.tensor(result["prompt_logprobs"][1:], dtype=torch.float64)
+    actor = _actor_logprobs(head, model, tokens)
+    diff = (sampler - actor).abs()
+    print(f"RESULT prompt_logprobs_vs_actor mean_abs={diff.mean().item():.4f} max_abs={diff.max().item():.4f}")
+    assert diff.mean().item() < 0.05
+
+
 def test_long_forward_backward_memory(server, model):
     head = server["head"]
     tokens = [1000 + (i * 7919) % 50000 for i in range(LONG_TOKENS + 1)]

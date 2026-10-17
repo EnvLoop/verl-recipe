@@ -1,0 +1,243 @@
+# Backport of vLLM PR #62049 (commit 0afca5af07, "[Bugfix][LoRA] Map lm_head LoRA to batch tokens for prompt
+# logprobs", fixes vllm-project/vllm#51594), code hunks only, rebased onto vLLM 0.26.0. Apache-2.0.
+Binary files src0.26.0/vllm/lora/__pycache__/model_manager.cpython-315.pyc and t26/vllm/lora/__pycache__/model_manager.cpython-315.pyc differ
+Binary files src0.26.0/vllm/lora/__pycache__/worker_manager.cpython-315.pyc and t26/vllm/lora/__pycache__/worker_manager.cpython-315.pyc differ
+diff -ruN src0.26.0/vllm/lora/model_manager.py t26/vllm/lora/model_manager.py
+--- a/vllm/lora/model_manager.py	2026-10-16 21:03:18
++++ b/vllm/lora/model_manager.py	2026-10-16 21:03:40
+@@ -3,6 +3,7 @@
+ 
+ import math
+ from collections.abc import Callable
++from contextlib import AbstractContextManager, nullcontext
+ from typing import TypeVar
+ 
+ import torch
+@@ -15,6 +16,7 @@
+     BaseLayerWithLoRA,
+     FusedMoE3DWithLoRA,
+     FusedMoEWithLoRA,
++    LogitsProcessorWithLoRA,
+     LoRAMapping,
+     LoRAMappingType,
+ )
+@@ -706,6 +708,16 @@
+             self.lora_config.target_modules,
+             self.packed_modules_mapping,
+         )
++
++    def token_logits_rows(self, start: int, end: int) -> AbstractContextManager:
++        """See `PunicaWrapperBase.token_logits_rows`.
++
++        A no-op unless the model has an lm_head LoRA layer.
++        """
++        for module in self.modules.values():
++            if isinstance(module, LogitsProcessorWithLoRA):
++                return module.punica_wrapper.token_logits_rows(start, end)
++        return nullcontext()
+ 
+     def _get_punica_wrapper(self, module_name: str) -> PunicaWrapperBase | None:
+         """
+Binary files src0.26.0/vllm/lora/punica_wrapper/__pycache__/punica_base.cpython-315.pyc and t26/vllm/lora/punica_wrapper/__pycache__/punica_base.cpython-315.pyc differ
+Binary files src0.26.0/vllm/lora/punica_wrapper/__pycache__/punica_gpu.cpython-315.pyc and t26/vllm/lora/punica_wrapper/__pycache__/punica_gpu.cpython-315.pyc differ
+diff -ruN src0.26.0/vllm/lora/punica_wrapper/punica_base.py t26/vllm/lora/punica_wrapper/punica_base.py
+--- a/vllm/lora/punica_wrapper/punica_base.py	2026-10-16 21:03:18
++++ b/vllm/lora/punica_wrapper/punica_base.py	2026-10-16 21:03:40
+@@ -8,6 +8,7 @@
+ """
+ 
+ from abc import ABC, abstractmethod
++from contextlib import AbstractContextManager, nullcontext
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -447,6 +448,20 @@
+         """
+         # TODO: implement it based on torch ops
+         raise NotImplementedError
++
++    def token_logits_rows(self, start: int, end: int) -> AbstractContextManager:
++        """Map logits rows to batch tokens [start, end) instead of sampled rows.
++
++        `add_lora_logits` assumes one logits row per sampled token (the
++        `prompt_mapping` of the current `LoRAMapping`). Callers that compute
++        logits for other rows, e.g. prompt logprobs, must call
++        `compute_logits(hidden_states[start:end])` inside this context, where
++        [start, end) indexes the flattened batch tokens. The sampled-row
++        mapping is restored on exit.
++        """
++        # TODO: implement for the CPU/XPU wrappers, which index
++        # `sampler_indices` directly in `add_lora_logits`.
++        return nullcontext()
+ 
+     def moe_lora_align_block_size(
+         self,
+diff -ruN src0.26.0/vllm/lora/punica_wrapper/punica_gpu.py t26/vllm/lora/punica_wrapper/punica_gpu.py
+--- a/vllm/lora/punica_wrapper/punica_gpu.py	2026-10-16 21:03:18
++++ b/vllm/lora/punica_wrapper/punica_gpu.py	2026-10-16 21:04:03
+@@ -7,6 +7,8 @@
+ https://arxiv.org/abs/2310.18547
+ """
+ 
++from collections.abc import Iterator
++from contextlib import contextmanager
+ from typing import final
+ 
+ import torch
+@@ -86,6 +88,14 @@
+         # Prepare cuda kernel metadata tensors
+         self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
+         self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
++
++    @contextmanager
++    def token_logits_rows(self, start: int, end: int) -> Iterator[None]:
++        self.prompt_mapping_meta.prepare_tensors(self.token_lora_indices[start:end])
++        try:
++            yield
++        finally:
++            self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
+ 
+     def add_shrink(
+         self,
+diff -ruN src0.26.0/vllm/lora/worker_manager.py t26/vllm/lora/worker_manager.py
+--- a/vllm/lora/worker_manager.py	2026-10-16 21:03:18
++++ b/vllm/lora/worker_manager.py	2026-10-16 21:03:40
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from contextlib import contextmanager
++from contextlib import AbstractContextManager, contextmanager
+ from typing import Any, Literal
+ 
+ import torch
+@@ -200,6 +200,9 @@
+             self._adapter_manager.supports_mm
+             and self._adapter_manager.supports_tower_connector_lora
+         )
++
++    def token_logits_rows(self, start: int, end: int) -> AbstractContextManager:
++        return self._adapter_manager.token_logits_rows(start, end)
+ 
+     def _apply_adapters(self, adapter_requests: set[Any]) -> None:
+         existing_adapters = self.list_adapters()
+Binary files src0.26.0/vllm/v1/worker/__pycache__/gpu_model_runner.cpython-315.pyc and t26/vllm/v1/worker/__pycache__/gpu_model_runner.cpython-315.pyc differ
+Binary files src0.26.0/vllm/v1/worker/__pycache__/lora_model_runner_mixin.cpython-315.pyc and t26/vllm/v1/worker/__pycache__/lora_model_runner_mixin.cpython-315.pyc differ
+Binary files src0.26.0/vllm/v1/worker/gpu/__pycache__/model_runner.cpython-315.pyc and t26/vllm/v1/worker/gpu/__pycache__/model_runner.cpython-315.pyc differ
+diff -ruN src0.26.0/vllm/v1/worker/gpu/model_runner.py t26/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-10-16 21:03:18
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-10-16 21:03:40
+@@ -347,6 +347,7 @@
+             self.prompt_logprobs_worker = PromptLogprobsWorker(
+                 self.max_num_reqs,
+                 logprobs_mode=self.model_config.logprobs_mode,
++                token_logits_rows=self.token_logits_rows,
+             )
+             self.structured_outputs_worker = StructuredOutputsWorker(
+                 max_num_logits=self.max_num_reqs * self.decode_query_len,
+Binary files src0.26.0/vllm/v1/worker/gpu/sample/__pycache__/prompt_logprob.cpython-315.pyc and t26/vllm/v1/worker/gpu/sample/__pycache__/prompt_logprob.cpython-315.pyc differ
+diff -ruN src0.26.0/vllm/v1/worker/gpu/sample/prompt_logprob.py t26/vllm/v1/worker/gpu/sample/prompt_logprob.py
+--- a/vllm/v1/worker/gpu/sample/prompt_logprob.py	2026-10-16 21:03:18
++++ b/vllm/v1/worker/gpu/sample/prompt_logprob.py	2026-10-16 21:04:03
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Callable
++from contextlib import AbstractContextManager, nullcontext
+ 
+ import numpy as np
+ import torch
+@@ -12,11 +13,25 @@
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+ from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+ 
++# token_logits_rows(start, end) wraps a logits_fn call on the hidden states of
++# batch tokens [start, end); see PunicaWrapperBase.token_logits_rows.
++TokenLogitsRowsFn = Callable[[int, int], AbstractContextManager]
+ 
++
++def _no_token_logits_rows(start: int, end: int) -> AbstractContextManager:
++    return nullcontext()
++
++
+ class PromptLogprobsWorker:
+-    def __init__(self, max_num_reqs: int, logprobs_mode: LogprobsMode = "raw_logprobs"):
++    def __init__(
++        self,
++        max_num_reqs: int,
++        logprobs_mode: LogprobsMode = "raw_logprobs",
++        token_logits_rows: TokenLogitsRowsFn = _no_token_logits_rows,
++    ):
+         self.max_num_reqs = max_num_reqs
+         self.logprobs_mode = logprobs_mode
++        self.token_logits_rows = token_logits_rows
+ 
+         self.uses_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=bool)
+         self.num_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=np.int32)
+@@ -85,6 +100,7 @@
+                 logits_fn,
+                 max_num_prompt_logprobs,
+                 self.logprobs_mode,
++                self.token_logits_rows,
+             )
+         )
+ 
+@@ -210,6 +226,7 @@
+     logits_fn: Callable[[torch.Tensor], torch.Tensor],
+     num_prompt_logprobs: int,
+     logprobs_mode: LogprobsMode = "raw_logprobs",
++    token_logits_rows: TokenLogitsRowsFn = _no_token_logits_rows,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     # Since materializing the full prompt logits can take too much memory,
+     # we compute it in chunks.
+@@ -222,7 +239,8 @@
+     for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
+         end_idx = start_idx + CHUNK_SIZE
+         # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
+-        prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
++        with token_logits_rows(start_idx, end_idx):
++            prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+         requested_num = (
+             prompt_logits.shape[-1]
+             if num_prompt_logprobs == -1
+diff -ruN src0.26.0/vllm/v1/worker/gpu_model_runner.py t26/vllm/v1/worker/gpu_model_runner.py
+--- a/vllm/v1/worker/gpu_model_runner.py	2026-10-16 21:03:18
++++ b/vllm/v1/worker/gpu_model_runner.py	2026-10-16 21:03:40
+@@ -5628,7 +5628,8 @@
+             req_idx = self.input_batch.req_id_to_index[req_id]
+             offset = self.query_start_loc.np[req_idx].item()
+             prompt_hidden_states = hidden_states[offset : offset + num_logits]
+-            logits = self.model.compute_logits(prompt_hidden_states)
++            with self.token_logits_rows(offset, offset + num_logits):
++                logits = self.model.compute_logits(prompt_hidden_states)
+ 
+             # Get the "target" tokens for each index. For prompt at index i,
+             # the token at prompt index i+1 is the "sampled" token we want
+diff -ruN src0.26.0/vllm/v1/worker/lora_model_runner_mixin.py t26/vllm/v1/worker/lora_model_runner_mixin.py
+--- a/vllm/v1/worker/lora_model_runner_mixin.py	2026-10-16 21:03:18
++++ b/vllm/v1/worker/lora_model_runner_mixin.py	2026-10-16 21:04:03
+@@ -4,7 +4,7 @@
+ Define LoRA functionality mixin for model runners.
+ """
+ 
+-from contextlib import contextmanager
++from contextlib import AbstractContextManager, contextmanager, nullcontext
+ from typing import TypeAlias
+ 
+ import numpy as np
+@@ -65,6 +65,15 @@
+             type=mapping_type,
+         )
+         self.lora_manager.set_active_adapters(lora_requests, lora_mapping)
++
++    def token_logits_rows(self, start: int, end: int) -> AbstractContextManager:
++        """Wrap `compute_logits(hidden_states[start:end])` calls on rows other
++        than the sampled ones, e.g. prompt logprobs, so an lm_head LoRA maps
++        each logits row to its batch token. See
++        `PunicaWrapperBase.token_logits_rows`."""
++        if not hasattr(self, "lora_manager"):
++            return nullcontext()
++        return self.lora_manager.token_logits_rows(start, end)
+ 
+     def _ensure_lora_enabled(self) -> None:
+         if not hasattr(self, "lora_manager"):
