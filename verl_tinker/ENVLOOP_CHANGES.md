@@ -506,6 +506,27 @@ end to end (EnvPlatform: `lora_targets.py`, guest overlay; this repo: the pieces
   value as `capabilities: {"lm_head_lora_prompt_logprobs": bool}` in `get_info` and
   `get_server_capabilities` (re-checked from the installed files, so it holds in every process).
   EnvLoop's gateway uses it to decide whether a head may sample adapters with an `lm_head` LoRA.
+* **Deterministic rollout LoRA (`vllm_lora_determinism`).** vLLM's default LoRA `shrink` kernel splits K 64 ways
+  and reduces with float `atomic_add` (vllm-project/vllm#50059; fix #50278 still open), so the rollout scores the
+  same prompt differently from one request to the next. `verl_tinker.start` sets `VLLM_TUNED_CONFIG_FOLDER` (vLLM's
+  tuned-kernel-config knob; an operator's own folder wins, `VLLM_BATCH_INVARIANT=1` is left alone) to
+  `vllm_lora_configs/`: `shrink` configs with `split_k=1` per GPU name (H100, H200, B200, A100 variants). Searched
+  vLLM 0.26-0.31 and upstream PRs: #59377 (merged, 0.32+) only covers `VLLM_BATCH_INVARIANT=1`, which swaps many
+  other kernels; the tuned folder is the narrowest existing knob. 27B, 2x H200 SXM (driver 615.71.09), FSDP2 + SP2
+  + fused + rollout TP 2 (#463 rendering), rank 8 all layers after 8 training steps, same prompt (e2e anchor, 28
+  tokens / training prompt, 22 tokens) max abs diff vs the first `compute_logprobs`:
+
+  | Repeat of the same request | default (split_k 64) | `enforce_eager` | split_k 1 |
+  |---|---|---|---|
+  | back to back | 0.490 / 0.090 | 0.125 / 0.075 | 0.0 / 0.0 |
+  | `topk_prompt_logprobs=5`, no sleep | 0.367 / 0.032 | 0.366 / 0.075 | 0.0 / 0.0 |
+  | after trainer forward (sleep/wake) | 0.244 / 0.078 | 0.009 / 0.075 | 0.0 / 0.0 |
+  | topk 5 after sleep/wake | 0.367 / 0.078 | 0.122 / 0.0 | 0.0 / 0.0 |
+  | after a second sleep/wake | 0.125 / 0.066 | 0.243 / 0.075 | 0.0 / 0.0 |
+
+  So the 27B "prompt_logprobs vs compute_logprobs" gap is LoRA kernel run-to-run noise, not sleep/wake, CUDA graphs
+  or prefix caching (vLLM skips the prefix cache for any request with `prompt_logprobs`). Sampler vs trainer is a
+  separate, unchanged bf16 difference (mean 0.03, max 0.36 on these prompts).
 * **Capability `lora_split_qkv`.** `verl_tinker.capabilities.LORA_SPLIT_QKV = True` declares that the rollout's
   vLLM serves adapters with separate `in_proj_{q,k,v}` LoRAs via the `vllm_split_qkv` general plugin. The head
   reports `capabilities.lora_split_qkv` in `get_info` / `get_server_capabilities` as True only when vLLM will load

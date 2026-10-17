@@ -1,0 +1,260 @@
+{
+ "1": {
+  "1": {
+   "1": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 256,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   },
+   "128": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 32,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   }
+  },
+  "2": {
+   "1": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 256,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   },
+   "128": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 32,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   }
+  },
+  "3": {
+   "1": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 256,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   },
+   "128": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 32,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   }
+  },
+  "4": {
+   "1": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 256,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   },
+   "128": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 32,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   }
+  },
+  "5": {
+   "1": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 256,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   },
+   "128": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 32,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   }
+  },
+  "6": {
+   "1": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 256,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   },
+   "128": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 32,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   }
+  },
+  "7": {
+   "1": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 256,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   },
+   "128": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 32,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   }
+  },
+  "8": {
+   "1": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 256,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   },
+   "128": {
+    "1": {
+     "1": {
+      "block_m": 32,
+      "block_n": 16,
+      "block_k": 32,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "group_size_m": 8,
+      "num_stages": 2,
+      "max_nreg": null
+     }
+    }
+   }
+  }
+ }
+}

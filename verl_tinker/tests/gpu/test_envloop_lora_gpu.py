@@ -330,6 +330,66 @@ def test_prompt_logprobs_match_the_actor(server, model):
     assert diff.mean().item() < 0.05
 
 
+def _rollout_prompt_logprobs(head, sampler_id: str, tokens: list[int], topk: int = 0) -> list[float]:
+    """compute_logprobs (topk 0) or sample(include_prompt_logprobs, topk_prompt_logprobs=topk) on the rollout."""
+    request = {
+        "sampling_session_id": sampler_id,
+        "seq_id": 0,
+        "prompt": {"chunks": [{"type": "encoded_text", "tokens": tokens}]},
+        "sampling_params": {"max_tokens": 1, "temperature": 1.0, "top_p": 1.0, "top_k": -1},
+        "num_samples": 1,
+        "prompt_logprobs": True,
+    }
+    if topk:
+        request["topk_prompt_logprobs"] = topk
+    return head.call("/api/v1/asample", request)["prompt_logprobs"][1:]
+
+
+@pytest.mark.skipif(not os.environ.get("LORA_GPU_GAP"), reason="set LORA_GPU_GAP=1 for the sleep/wake check")
+def test_prompt_logprobs_stable_across_rollout_sleep(server, model):
+    """The same prompt scored by the rollout before and after a trainer forward (rollout sleep -> wake).
+
+    Mirrors the e2e ``sampling`` check (research/tinker-alignment/27b-prompt-logprob-gap.md): compute_logprobs,
+    trainer forward, then sample(include_prompt_logprobs, topk_prompt_logprobs=5). Runs after training so the
+    adapter (incl. lm_head) is far from zero. Prints per-position values and max/mean diffs.
+    """
+    from transformers import AutoTokenizer
+
+    head = server["head"]
+    tokenizer = AutoTokenizer.from_pretrained(os.environ["TINKER_SERVER_MODEL_PATH"])
+    question, answer = "What is the capital of France?", "The capital of France is Paris."  # e2e ANCHOR_EXAMPLES[1]
+    messages = [{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, enable_thinking=False)
+    prompts = {"anchor": list(tokenizer.encode(text, add_special_tokens=False)), "train": PROMPT + COMPLETION}
+    sampler = head.call(
+        "/api/v1/save_weights_for_sampler",
+        {"model_id": model["model_id"], "path": None, "sampling_session_seq_id": 20},
+    )["sampling_session_id"]
+    for name, tokens in prompts.items():
+        runs = {}
+        runs["a"] = _rollout_prompt_logprobs(head, sampler, tokens)
+        runs["b_back_to_back"] = _rollout_prompt_logprobs(head, sampler, tokens)
+        runs["c_topk5_no_sleep"] = _rollout_prompt_logprobs(head, sampler, tokens, topk=5)
+        actor = _actor_logprobs(head, model, tokens).tolist()  # trainer forward: rollout sleeps, wakes on next call
+        runs["d_after_sleep"] = _rollout_prompt_logprobs(head, sampler, tokens)
+        runs["e_topk5_after_sleep"] = _rollout_prompt_logprobs(head, sampler, tokens, topk=5)
+        _actor_logprobs(head, model, tokens)
+        runs["f_after_second_sleep"] = _rollout_prompt_logprobs(head, sampler, tokens)
+        reference = torch.tensor(runs["a"], dtype=torch.float64)
+        summary = {}
+        for key, values in runs.items():
+            diff = (torch.tensor(values, dtype=torch.float64) - reference).abs()
+            summary[key] = {"max": round(diff.max().item(), 5), "mean": round(diff.mean().item(), 5)}
+        vs_actor = (reference - torch.tensor(actor, dtype=torch.float64)).abs()
+        summary["a_vs_actor"] = {"max": round(vs_actor.max().item(), 5), "mean": round(vs_actor.mean().item(), 5)}
+        print(f"RESULT gap {name} prompt_tokens={len(tokens)} diffs_vs_a={json.dumps(summary)}")
+        rows = [
+            [i + 1, tokens[i + 1], round(actor[i], 4), *(round(runs[key][i], 4) for key in runs)]
+            for i in range(len(tokens) - 1)
+        ]
+        print(f"RESULT gap_positions {name} columns={['pos', 'token', 'actor', *runs]} rows={json.dumps(rows)}")
+
+
 def test_long_forward_backward_memory(server, model):
     head = server["head"]
     tokens = [1000 + (i * 7919) % 50000 for i in range(LONG_TOKENS + 1)]

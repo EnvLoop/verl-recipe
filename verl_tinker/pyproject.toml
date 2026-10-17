@@ -45,7 +45,7 @@ dependencies = [
 verl_tinker_split_qkv_lora = "verl_tinker.vllm_split_qkv:register"
 
 [tool.setuptools.package-data]
-verl_tinker = ["vllm_backports/*.diff"]
+verl_tinker = ["vllm_backports/*.diff", "vllm_lora_configs/*.json"]
 
 [dependency-groups]
 test = [

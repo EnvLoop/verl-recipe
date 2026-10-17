@@ -15,6 +15,7 @@
 """Tinker LoraConfig parity on CPU: explicit target modules, seed, reporting, vLLM backports."""
 
 import copy
+import json
 import re
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -618,3 +619,41 @@ def test_legacy_optimizer_load_maps_verl_whole_model_param_order(tmp_path):
         ]["exp_avg_sq"],
     )
     assert not split_opt.state[by_name["base_model.model.linear_attn.out_proj.base_layer.weight"]]
+
+
+def _vllm_tuned_lookup(config_data: dict, max_loras: int, num_slices: int, m: int, k: int, n: int) -> dict:
+    """vLLM 0.26 ``get_lora_op_configs`` nearest-key lookup (vllm/lora/ops/triton_ops/utils.py)."""
+
+    def pick(data, value):
+        return data.get(str(value)) or data[min(data.keys(), key=lambda x: abs(int(x) - value))]
+
+    return pick(pick(pick(pick(config_data, max_loras)[str(num_slices)], m), k), n)
+
+
+def test_rollout_lora_shrink_configs_never_split_k(monkeypatch):
+    from verl_tinker import vllm_lora_determinism
+
+    files = sorted(vllm_lora_determinism.CONFIG_DIR.glob("*_SHRINK.json"))
+    assert {f.name for f in files} >= {
+        "NVIDIA_H100_80GB_HBM3_SHRINK.json",
+        "NVIDIA_H200_SHRINK.json",
+        "NVIDIA_B200_SHRINK.json",
+    }
+    for path in files:
+        data = json.loads(path.read_text())
+        for max_loras in (1, 4, 16):
+            for num_slices in (1, 2, 3, 4):
+                for m in (1, 22, 127, 128, 8192):
+                    config = _vllm_tuned_lookup(data, max_loras, num_slices, m, 5120, 128)
+                    assert config["split_k"] == 1, (path.name, num_slices, m)
+                    assert {"block_m", "block_n", "block_k", "num_warps", "num_stages"} <= set(config)
+
+    environ = {}
+    vllm_lora_determinism.enable(environ)
+    assert environ == {"VLLM_TUNED_CONFIG_FOLDER": str(vllm_lora_determinism.CONFIG_DIR)}
+    environ = {"VLLM_TUNED_CONFIG_FOLDER": "/opt/tuned"}
+    vllm_lora_determinism.enable(environ)
+    assert environ == {"VLLM_TUNED_CONFIG_FOLDER": "/opt/tuned"}  # the operator's folder wins
+    environ = {"VLLM_BATCH_INVARIANT": "1"}
+    vllm_lora_determinism.enable(environ)
+    assert environ == {"VLLM_BATCH_INVARIANT": "1"}  # vLLM ignores tuned configs then
