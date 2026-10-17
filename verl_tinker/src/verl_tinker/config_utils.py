@@ -164,7 +164,6 @@ def apply_tinker_server_overrides(
     """Apply only Tinker-server-specific config adjustments."""
 
     _apply_server_defaults(config)
-    _default_tp_rollout_all_reduce_to_nccl(config)
     _disable_verl_model_offload(config)
     _apply_micro_batch_default(
         config,
@@ -211,25 +210,6 @@ def _apply_server_defaults(config: DictConfig) -> None:
     for key, value in DEFAULT_SERVER_CONFIG.items():
         if _is_missing(config.server.get(key)):
             OmegaConf.update(config, f"server.{key}", value, merge=True)
-
-
-def _default_tp_rollout_all_reduce_to_nccl(config: DictConfig) -> None:
-    """A tensor-parallel vLLM rollout all-reduces through NCCL unless the config says otherwise.
-
-    vLLM's custom all-reduce writes to the peer GPU through CUDA IPC handles after a
-    P2P probe that can pass on hosts where those kernel stores fault (EnvLoop prod
-    2026-10-17, rented 2x H100 without NVLink: "illegal memory access" during CUDA graph
-    profiling, so the rollout engine never started). NCCL picks a working transport
-    itself. An explicit ``disable_custom_all_reduce`` in the config is kept.
-    """
-    if is_no_rollout_deployment(config) or _select(config, "actor_rollout_ref.rollout.name", "vllm") != "vllm":
-        return
-    tp_size = _select(config, "actor_rollout_ref.rollout.tensor_model_parallel_size", 1)
-    if _is_missing(tp_size) or int(tp_size) <= 1:
-        return
-    path = "actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce"
-    if _is_missing(_select(config, path)):
-        OmegaConf.update(config, path, True, merge=True)
 
 
 def _disable_verl_model_offload(config: DictConfig) -> None:
