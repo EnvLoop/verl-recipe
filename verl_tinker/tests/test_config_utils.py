@@ -499,3 +499,21 @@ def test_reference_worker_enablement_falls_back_to_legacy_verl_settings():
     config.algorithm.use_kl_in_reward = True
 
     assert needs_reference_policy(config) is True
+
+
+@pytest.mark.parametrize(("rollout_start", "expected"), [(None, "eager"), ("lazy", "lazy"), ("eager", "eager")])
+def test_rollout_start_defaults_to_eager(rollout_start, expected):
+    config = _minimal_tinker_config()
+    if rollout_start is not None:
+        config.server.rollout_start = rollout_start
+
+    assert process_actor_rollout_ref_config(config).server.rollout_start == expected
+
+
+def test_unknown_rollout_start_is_rejected():
+    config = _minimal_tinker_config()
+    config.server.rollout_start = "later"
+
+    errors = _validate_config(config)
+
+    assert "server.rollout_start must be one of ['eager', 'lazy'], got 'later'" in errors

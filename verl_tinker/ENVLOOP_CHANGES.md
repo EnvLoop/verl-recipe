@@ -306,3 +306,39 @@ back (EnvLoop prod 2026-10-17: a Qwen3.8-27B `forward_backward` after `load_stat
 the EnvLoop gateway) the SDK's retry got "future id result already retrieved" and the training call
 failed. The router now keeps the last 1024 retrieved results and errors and returns them again on a
 repeated retrieve; older ids still report that they were seen.
+
+## The rollout can start on first use (`server.rollout_start: lazy`)
+
+A colocated server used to start vLLM next to the FSDP actor at startup, so every session paid for a
+second model copy on its GPUs even if it only trained (SFT, custom losses, forward-only, checkpoints).
+For Qwen3.8-27B that is the difference between ~49 GB/card actor-only on 2× H100 and the sampler's
+weights + KV cache + a full-summon sync, and the TP 2 EngineCore start is what fails on many non-NVLink
+hosts. With `server.rollout_start: lazy` (default `eager`, unchanged):
+
+* `ColocatedBackend` skips `_init_rollout_replicas` at startup (healthz reports `"rollout": "not_started"`).
+  `start_rollout` later runs exactly the eager init — offload the actor, `RolloutReplica.init_hybrid`,
+  `CheckpointEngineManager`, warm + sleep — under the engine lock, so everything inside
+  `_init_rollout_replicas` (including adapter slots added there) is unchanged; `update_weights` starts it
+  first when needed. verl has no deferred rollout init (searched cfacd76a and main 18cfb74); this only
+  defers verl's own call.
+* `ModelResourceManager` tracks a pending rollout: `rollout_id` is `None` until it starts, scalar
+  `compute_logprobs` prefers the actor (or the LoRA reference for version zero), and `lazy_rollout_plan`
+  says how a start serves a binding — vLLM's own base weights for version zero when it loads them from disk
+  (`load_format` not `dummy`), otherwise a sync of the actor's current weights right after the start (so a
+  `dummy` rollout never reports base weights it does not hold). Versions neither can produce stay 409.
+* The router starts the rollout inside the request's scheduled future: the first `save_weights_for_sampler`,
+  or the first `asample` that needs decoding (or a scalar request the actor cannot serve). The HTTP call
+  returns at once and the SDK polls `retrieve_future` (`try_again`) while vLLM starts; concurrent samples
+  wait on one start. `create_sampling_session` stays bookkeeping only, so creating a sampler and calling
+  `compute_logprobs` never loads vLLM.
+* A failed start is not retried in-process: the request fails with `ROLLOUT_ENGINE_START_FAILED: ...`,
+  later sampler requests fail fast with the same message, and healthz adds `rollout: failed` +
+  `rollout_error` (status stays `ready`).
+* Scalar `compute_logprobs` served by the actor before the start and by vLLM after it come from different
+  engines (the gap described in "Combined prompt logprobs stay on the sampler"); after the start the rollout serves
+  them, as on an eager server.
+
+Validation: CPU suite (`tests/test_colocated_backend.py`, `tests/test_model_resource_manager.py`,
+`tests/test_tinker_router.py`, `tests/test_config_utils.py`); GPU `tests/gpu/test_envloop_lazy_rollout_gpu.py`
+(training without vLLM, first sampler save starts it, sample/compute_logprobs/trainer agreement, another
+train/sync/sample cycle; `TINKER_LAZY_TRAIN_ONLY=1` for actor-only shapes).

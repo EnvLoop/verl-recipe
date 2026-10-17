@@ -4,6 +4,7 @@
 
 import pytest
 from verl_tinker.model_resource_manager import (
+    LazyRolloutPlan,
     ModelResourceManager,
     ModelResourceManagerError,
     SamplingResource,
@@ -277,3 +278,94 @@ def test_teacher_model_path_takes_precedence_over_actor_base_model():
 
     assert binding.is_teacher
     assert binding.teacher_model_path == "/models/teacher"
+
+
+def _lazy_tracker(*, loads_base_weights: bool) -> ModelResourceManager:
+    tracker = _tracker()
+    tracker.configure_resources(
+        rollout_enabled=True,
+        reference_enabled=False,
+        rollout_started=False,
+        rollout_loads_base_weights=loads_base_weights,
+    )
+    return tracker
+
+
+def test_lazy_rollout_holds_no_weights_and_scalar_logprobs_prefer_the_actor():
+    tracker = _lazy_tracker(loads_base_weights=False)
+    binding = tracker.register_actor_sampler("s", base_model="actor", actor_id=0)
+
+    assert tracker.rollout_pending
+    assert tracker.rollout_id is None
+    assert tracker.resolve_resource(binding, scalar_prompt_logprobs=True) is SamplingResource.ACTOR
+    # Decoding needs the rollout: the caller starts it with the plan, then re-resolves.
+    assert tracker.resolve_resource(binding, scalar_prompt_logprobs=False) is SamplingResource.ROLLOUT
+    assert tracker.lazy_rollout_plan(binding) is LazyRolloutPlan.SYNC
+    assert tracker.valid_sampler_ids() == ["s"]
+
+
+def test_lazy_rollout_plan_uses_vllm_base_weights_only_for_version_zero():
+    tracker = _lazy_tracker(loads_base_weights=True)
+    base = tracker.register_actor_sampler("base", base_model="actor", actor_id=0)
+    tracker.actor_updated()
+    current = tracker.register_actor_sampler("current", base_model="actor", actor_id=tracker.actor_id)
+
+    assert tracker.lazy_rollout_plan(base) is LazyRolloutPlan.BASE
+    assert tracker.lazy_rollout_plan(current) is LazyRolloutPlan.SYNC
+    assert tracker.lazy_rollout_plan(None) is LazyRolloutPlan.BASE
+    assert _lazy_tracker(loads_base_weights=False).lazy_rollout_plan(None) is LazyRolloutPlan.SYNC
+
+
+def test_lazy_rollout_cannot_serve_a_version_neither_vllm_nor_the_actor_holds():
+    tracker = _lazy_tracker(loads_base_weights=False)
+    old = tracker.register_actor_sampler("old", base_model="actor", actor_id=0)
+    tracker.actor_updated()
+
+    assert tracker.lazy_rollout_plan(old) is None
+    with pytest.raises(StaleSamplerError, match="rollout_started=False"):
+        tracker.resolve_resource(old, scalar_prompt_logprobs=False)
+    assert "old" not in tracker.valid_sampler_ids()
+
+
+@pytest.mark.parametrize(("plan", "expected_rollout_id"), [(LazyRolloutPlan.BASE, 0), (LazyRolloutPlan.SYNC, 1)])
+def test_lazy_rollout_start_records_the_weights_it_holds(plan, expected_rollout_id):
+    tracker = _lazy_tracker(loads_base_weights=True)
+    tracker.actor_updated()
+    current = tracker.register_actor_sampler("current", base_model="actor", actor_id=1)
+
+    assert tracker.rollout_started(plan) == expected_rollout_id
+    assert not tracker.rollout_pending
+    assert tracker.lazy_rollout_plan(current) is None
+    # Once the rollout holds the weights it serves compute_logprobs too, like an eager server.
+    if expected_rollout_id == 1:
+        assert tracker.resolve_resource(current, scalar_prompt_logprobs=True) is SamplingResource.ROLLOUT
+
+
+def test_sampler_save_marks_a_lazy_rollout_started():
+    tracker = _lazy_tracker(loads_base_weights=False)
+    tracker.actor_updated()
+
+    assert tracker.rollout_synchronized() == 1
+    assert not tracker.rollout_pending
+
+
+@pytest.mark.parametrize("started", [True, False])
+def test_failed_lazy_start_or_sync_records_whether_the_rollout_exists(started):
+    tracker = _lazy_tracker(loads_base_weights=True)
+    base = tracker.register_actor_sampler("base", base_model="actor", actor_id=0)
+
+    tracker.rollout_synchronization_failed(rollout_started=started)
+
+    assert tracker.rollout_id is None
+    assert tracker.rollout_pending is not started
+    # A started rollout with unknown weights must never be assumed to hold the base model.
+    assert (tracker.lazy_rollout_plan(base) is None) is started
+
+
+def test_eager_configuration_is_unchanged_by_the_lazy_switch():
+    tracker = _tracker()
+    tracker.configure_resources(rollout_enabled=True, reference_enabled=False)
+
+    assert not tracker.rollout_pending
+    assert tracker.rollout_id == 0
+    assert tracker.lazy_rollout_plan(None) is None

@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import asyncio
+import threading
+import time
 from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -21,6 +23,7 @@ import pytest
 from fastapi import HTTPException
 from omegaconf import OmegaConf
 from pydantic import TypeAdapter, ValidationError
+from verl_tinker.backends.colocated import ROLLOUT_ENGINE_START_FAILED, RolloutStartError, RolloutState
 from verl_tinker.config_utils import _validate_config
 from verl_tinker.model_resource_manager import ModelResourceManager
 from verl_tinker.schemas import TinkerLossFnType
@@ -1039,3 +1042,158 @@ def test_recently_retrieved_results_are_bounded(monkeypatch):
     for request_id in ("a", "b", "c"):
         server._remember_retrieved(request_id, {"type": request_id})
     assert list(server._recently_retrieved) == ["b", "c"]
+
+# ==================== Lazy rollout start (EnvLoop) ====================
+
+
+def _lazy_server(*, loads_base_weights: bool):
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = MagicMock()
+    server._engine.rollout_state = RolloutState.NOT_STARTED
+    server._engine.rollout_start_error = None
+    server._teacher_backend = None
+    server._op_gate = FifoReadWriteGate()
+    server._rollout_start_lock = asyncio.Lock()
+    _init_future_tracking(server)
+    _init_model_resource_manager(server)
+    server._model_resource_manager.configure_resources(
+        rollout_enabled=True,
+        reference_enabled=False,
+        rollout_started=False,
+        rollout_loads_base_weights=loads_base_weights,
+    )
+    return server
+
+
+def _decode_request(sampling_session_id: str):
+    return _sample_request(sampling_session_id, prompt_logprobs=False)
+
+
+@pytest.mark.asyncio
+async def test_lazy_sample_starts_the_rollout_inside_its_future_then_decodes(monkeypatch):
+    server = _lazy_server(loads_base_weights=False)
+    server._model_resource_manager.register_actor_sampler("s", base_model="actor", actor_id=0)
+    started = threading.Event()
+    release = threading.Event()
+
+    def start_rollout(**_kwargs):
+        started.set()
+        release.wait(5)
+        server._engine.rollout_state = RolloutState.READY
+        return True
+
+    server._engine.start_rollout = MagicMock(side_effect=start_rollout)
+    sample = AsyncMock(return_value={"type": "sample", "sequences": []})
+    monkeypatch.setitem(server.asample.__globals__, "tinker_sample", sample)
+
+    response = await server.asample(_decode_request("s"))
+    await asyncio.to_thread(started.wait, 5)
+    # The HTTP call returned at once; while vLLM starts the future is still pending (SDK: try_again).
+    assert response["request_id"] in server._pending
+    release.set()
+    await asyncio.gather(*server._pending.values())
+
+    server._engine.start_rollout.assert_called_once_with(sync_weights=True, reason=ANY)
+    sample.assert_awaited_once()
+    assert server._model_resource_manager.rollout_id == 0
+    assert not server._model_resource_manager.rollout_pending
+
+
+@pytest.mark.asyncio
+async def test_lazy_scalar_prompt_logprobs_are_served_by_the_actor_without_starting_vllm(monkeypatch):
+    server = _lazy_server(loads_base_weights=False)
+    server._model_resource_manager.register_actor_sampler("s", base_model="actor", actor_id=0)
+    prompt_logprobs = AsyncMock(return_value={"type": "sample", "prompt_logprobs": [None, -0.5]})
+    monkeypatch.setitem(server.asample.__globals__, "tinker_sample_prompt_logprobs", prompt_logprobs)
+
+    await server.asample(_sample_request("s", prompt_logprobs=True))
+    await asyncio.gather(*server._pending.values())
+
+    prompt_logprobs.assert_awaited_once_with(server._engine, ANY, reference=False)
+    server._engine.start_rollout.assert_not_called()
+    assert server._model_resource_manager.rollout_pending
+
+
+@pytest.mark.asyncio
+async def test_lazy_base_sampler_after_training_uses_vllm_base_weights_without_a_sync(monkeypatch):
+    server = _lazy_server(loads_base_weights=True)
+    server._model_resource_manager.register_actor_sampler("base", base_model="actor", actor_id=0)
+    server._model_resource_manager.actor_updated()
+    server._engine.start_rollout = MagicMock(return_value=True)
+    monkeypatch.setitem(server.asample.__globals__, "tinker_sample", AsyncMock(return_value={"type": "sample"}))
+
+    await server.asample(_decode_request("base"))
+    await asyncio.gather(*server._pending.values())
+
+    server._engine.start_rollout.assert_called_once_with(sync_weights=False, reason=ANY)
+    assert server._model_resource_manager.rollout_id == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_lazy_samples_start_the_rollout_once(monkeypatch):
+    server = _lazy_server(loads_base_weights=False)
+    server._model_resource_manager.register_actor_sampler("s", base_model="actor", actor_id=0)
+    server._engine.start_rollout = MagicMock(side_effect=lambda **_: time.sleep(0.05) or True)
+    sample = AsyncMock(return_value={"type": "sample"})
+    monkeypatch.setitem(server.asample.__globals__, "tinker_sample", sample)
+
+    for _ in range(4):
+        await server.asample(_decode_request("s"))
+    await asyncio.gather(*server._pending.values())
+
+    assert server._engine.start_rollout.call_count == 1
+    assert sample.await_count == 4
+    assert not server._errors
+
+
+@pytest.mark.asyncio
+async def test_lazy_start_failure_fails_the_sample_with_a_typed_error(monkeypatch):
+    server = _lazy_server(loads_base_weights=False)
+    server._model_resource_manager.register_actor_sampler("s", base_model="actor", actor_id=0)
+
+    def start_rollout(**_kwargs):
+        server._engine.rollout_state = RolloutState.FAILED
+        raise RolloutStartError(f"{ROLLOUT_ENGINE_START_FAILED}: the sampling engine failed to start")
+
+    server._engine.start_rollout = MagicMock(side_effect=start_rollout)
+    monkeypatch.setitem(server.asample.__globals__, "tinker_sample", AsyncMock())
+
+    response = await server.asample(_decode_request("s"))
+    await asyncio.gather(*server._pending.values())
+
+    assert ROLLOUT_ENGINE_START_FAILED in server._errors[response["request_id"]]
+    # The engine owns the failed state; the next sampler request gets the same typed error.
+    assert server._model_resource_manager.rollout_pending
+    assert server._status is ServerStatus.INITIALIZED
+
+
+@pytest.mark.asyncio
+async def test_sampler_save_on_a_lazy_server_records_the_started_rollout(monkeypatch):
+    server = _lazy_server(loads_base_weights=False)
+    server._model_resource_manager.actor_updated()
+    monkeypatch.setitem(
+        server._run_save_weights_for_sampler.__globals__,
+        "tinker_save_weights_for_sampler",
+        AsyncMock(return_value={"type": "save_weights_for_sampler", "path": "tinker://x/weights/a"}),
+    )
+
+    await server._run_save_weights_for_sampler(SimpleNamespace(path="a", sampling_session_seq_id=None))
+
+    assert not server._model_resource_manager.rollout_pending
+    assert server._model_resource_manager.rollout_id == 1
+
+
+@pytest.mark.asyncio
+async def test_healthz_reports_the_lazy_rollout_state():
+    server = _lazy_server(loads_base_weights=False)
+    assert await server.healthz() == {"status": "ready", "rollout": "not_started"}
+
+    server._engine.rollout_state = RolloutState.FAILED
+    server._engine.rollout_start_error = f"{ROLLOUT_ENGINE_START_FAILED}: boom"
+    assert await server.healthz() == {
+        "status": "ready",
+        "rollout": "failed",
+        "rollout_error": f"{ROLLOUT_ENGINE_START_FAILED}: boom",
+    }
