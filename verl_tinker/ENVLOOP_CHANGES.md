@@ -274,22 +274,6 @@ FSDP1, TP 2: the ~2.5 GB embedding exceeds the bucket; Qwen3.5-4B never takes th
 module now patches `BucketedWeightSender._direct_send_large_weight` at import (in every Ray worker that
 loads the worker classes) to copy host tensors to the sender's device first.
 
-## LoRA rollout sync gathers one FSDP unit at a time (Qwen3.8-27B on 80 GB cards)
-
-`collect_lora_params(layered_summon=False)` summons the whole FSDP1 model to read the adapter: ~54 GB
-per GPU for Qwen3.8-27B on top of the awake vLLM weights, an OOM at the first `save_weights_for_sampler`
-on 2× H100 80 GB (EnvLoop prod e2e 2026-10-17; it only fit on B200). VeRL's `layered_summon_lora_params`
-would gather per unit, but it tests the *unit-relative* parameter names for `lora_`, and VeRL's LoRA wrap
-policy wraps every trainable LoRA leaf (`...q_proj.lora_A.default`) as its own FSDP unit whose only
-parameter is `weight`, so it returns nothing and VeRL falls back to a full summon (to host memory).
-The backend module replaces it at import with `_layered_lora_params`: it tests full names, gathers only
-units that own adapter tensors, and raises unless it returns every adapter tensor of the model
-(`tests/test_layered_lora_collection.py` runs both collectors on VeRL's wrapping of a tiny Llama).
-Layered summon needs vLLM to load the base weights itself (`rollout.load_format: safetensors`). For
-Qwen3.8-27B in the colocated engine that fails: vLLM's CUDA-graph memory profiling hits "an illegal memory
-access" after loading the weights (EnvLoop prod 2026-10-17, two hosts; dummy weights start fine). EnvLoop
-therefore keeps 27B on dummy weights + full-summon sync and schedules it on 141 GB cards, where that fits.
-
 ## Combined prompt logprobs stay on the sampler (reverts fa571c9)
 
 fa571c9 scored the scalar `prompt_logprobs` of a request that also asks for `topk_prompt_logprobs` on the
