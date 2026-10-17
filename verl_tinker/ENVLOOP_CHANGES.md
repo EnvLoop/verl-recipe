@@ -563,6 +563,13 @@ Split q/k/v LoRAs (2026-10-17, 1x H100, Qwen3.5-4B, fused log-prob kernels on):
 | legacy fused adapter (HF PEFT, rank 8) on vLLM 0.26 + plugin vs HF + PEFT | 0.022 mean (adapter effect 0.665) |
 | same on vLLM 0.31 + plugin + #62049 (the sampling pool's engine) | 0.029 mean |
 | split adapter from training on vLLM 0.31 + plugin + #62049 vs actor | 0.035 mean prompt logprobs, greedy completion 9/10 tokens identical |
+| Qwen3.8-27B (2x H200, FSDP1, TP2), rank 8, all layers: exported adapter | 60,354,560 parameters = 8 x 7,544,320 (the reference's 27B rank-8 count) |
+| same, fused-q/k/v checkpoint resumed by a split server (FSDP1 path) | actor logprobs identical (max diff 0.00000) |
+| same, sampler vs actor / prompt logprobs vs actor (layered sync + safetensors) | 0.023 / 0.027 mean |
+
+The 27B sampler rows needed `layered_summon: true` + `load_format: safetensors`: with the production 27B
+setting (layered off, dummy load) the first sampler save OOMs on 2x H200 regardless of this change (also
+with the previous fused layout); reported separately.
 
 Correction: an earlier draft said vLLM 0.31 ignores a Qwen3.5 `lm_head` LoRA. It applies it when
 generating; what differed was prompt logprobs, i.e. the #62049 bug above (found by the EnvLoop
