@@ -180,7 +180,60 @@ def split_legacy_tensors(tensors: Mapping[str, torch.Tensor], split_sizes: tuple
     return out
 
 
+def legacy_split_names(state_dict_keys: Iterable[str]) -> dict[str, list[str]]:
+    """Fused ``in_proj_qkv`` LoRA keys of a checkpoint -> the keys of the split layer they become.
+
+    ``…in_proj_qkv.lora_A.default.weight`` -> ``…in_proj_qkv.lora_A.default.{q,k,v}.weight``.
+    """
+    out = {}
+    for key in state_dict_keys:
+        match = _FUSED_PARAM.match(key)
+        if match is not None:
+            base = f"{match['prefix']}in_proj_qkv.lora_{match['ab']}{match['adapter'] or ''}"
+            out[key] = [f"{base}.{name}.weight" for name in SLICES]
+    return out
+
+
+def full_tensor(parts: list) -> torch.Tensor:
+    """One parameter from every rank's sharded checkpoint entry (DTensor, ShardedTensor or plain)."""
+    first = parts[0]
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:  # pragma: no cover
+        DTensor = ()  # noqa: N806
+    if isinstance(first, DTensor):
+        (placement,) = first.placements
+        if type(placement).__name__ == "Replicate":
+            return first.to_local()
+        return torch.cat([part.to_local() for part in parts], dim=placement.dim)
+    if hasattr(first, "local_shards") and hasattr(first, "metadata"):  # FSDP1 ShardedTensor
+        full = torch.zeros(tuple(first.size()), dtype=first.dtype)
+        for part in parts:
+            for shard in part.local_shards():
+                index = tuple(slice(o, o + n) for o, n in zip(shard.metadata.shard_offsets, shard.metadata.shard_sizes))
+                full[index] = shard.tensor.to("cpu")
+        return full
+    return first
+
+
+def convert_legacy_full(full: Mapping[str, torch.Tensor], names: Mapping[str, list[str]], split_sizes) -> dict:
+    """Full legacy tensors -> full tensors of the split layer (``split_sizes(key) -> (q, k, v)``); exact."""
+    out = {}
+    for key, tensor in full.items():
+        targets = names.get(key)
+        if targets is None:
+            out[key] = tensor
+            continue
+        parts = [tensor] * 3 if ".lora_A" in key else list(tensor.split(list(split_sizes(key)), dim=0))
+        for target, part in zip(targets, parts, strict=True):
+            out[target] = part.clone()
+    return out
+
+
 __all__ = [
+    "convert_legacy_full",
+    "full_tensor",
+    "legacy_split_names",
     "SplitQKVLinear",
     "SplitQKVLoraLinear",
     "lora_config_class",

@@ -318,3 +318,36 @@ def test_long_forward_backward_memory(server, model):
         f"RESULT long_fwd_bwd tokens={LONG_TOKENS} seconds={time.monotonic() - started:.1f} "
         f"peak_so_far_mib={json.dumps(server['memory'].peak)}"
     )
+
+
+def test_legacy_fused_checkpoint_round_trip(server, model):
+    """LORA_GPU_LEGACY=save on a server with ``lora.split_qkv: false`` writes a fused-q/k/v checkpoint and its
+    logprobs; LORA_GPU_LEGACY=load on a split server (same checkpoint dir) resumes it and must reproduce them."""
+    mode = os.environ.get("LORA_GPU_LEGACY")
+    if not mode:
+        pytest.skip("LORA_GPU_LEGACY not set")
+    head = server["head"]
+    record = Path(os.environ.get("LORA_GPU_LEGACY_RECORD", "/w/dump/legacy.json"))
+    tokens = PROMPT + COMPLETION
+    if mode == "save":
+        datum = _datum(tokens, weights=_tensor([0.0] * (len(PROMPT) - 1) + [1.0] * len(COMPLETION)))
+        for _ in range(4):
+            _forward_backward(head, model, datum)
+            _optim(head, model, lr=1e-3, eps=1e-8)
+        path = head.call("/api/v1/save_weights", {"model_id": model["model_id"], "path": "legacy-ckpt"})["path"]
+        record.write_text(json.dumps({"path": path, "logprobs": _actor_logprobs(head, model, tokens).tolist()}))
+        print(f"RESULT legacy_saved path={path}")
+        return
+    saved = json.loads(record.read_text())
+    before = _actor_logprobs(head, model, tokens)
+    head.call("/api/v1/load_weights", {"model_id": model["model_id"], "path": saved["path"], "optimizer": False})
+    after = _actor_logprobs(head, model, tokens)
+    expected = torch.tensor(saved["logprobs"], dtype=torch.float64)
+    diff = (after - expected).abs()
+    print(f"RESULT legacy_resume mean_abs={diff.mean().item():.5f} max_abs={diff.max().item():.5f} "
+          f"untrained_vs_saved={(before - expected).abs().mean().item():.4f}")
+    assert diff.max().item() < 0.05
+    # The rollout gets the converted adapter too.
+    sampled = _sampler_vs_actor(head, model, 20)
+    print(f"RESULT legacy_resume_sampler_vs_actor {sampled}")
+    assert sampled["mean_abs"] < 0.05

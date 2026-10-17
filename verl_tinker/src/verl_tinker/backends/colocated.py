@@ -232,7 +232,8 @@ def _patch_lora_build() -> None:
       ``get_peft_model`` and VeRL's ``LoraConfig`` is swapped for one that routes it to the split
       LoRA layer, so the fused projection trains three independent LoRAs (q, k, v) like the
       reference. The base weight and its name are unchanged. Not for adapters loaded from
-      ``lora_adapter_path`` (PEFT rebuilds those from their own config).
+      ``lora_adapter_path`` (PEFT rebuilds those from their own config);
+      ``actor_rollout_ref.model.lora.split_qkv: false`` keeps the fused LoRA (previous layout).
     * Seed: VeRL creates the adapter with ``get_peft_model`` (``lora_A`` Kaiming uniform from the
       global torch RNG, ``lora_B`` zero) before FSDP wrapping, and rank 0's initialised weights are
       what FSDP broadcasts to every rank. Seeding the RNGs (CPU and the current accelerator) for
@@ -258,7 +259,9 @@ def _patch_lora_build() -> None:
         import torch
 
         with ExitStack() as stack:
-            if getattr(self.model_config, "lora_adapter_path", None) is None and mark_split_qkv(module):
+            lora = getattr(self.model_config, "lora", None) or {}
+            split = lora.get("split_qkv", True) if hasattr(lora, "get") else True
+            if split and getattr(self.model_config, "lora_adapter_path", None) is None and mark_split_qkv(module):
                 default_config = transformer_impl.LoraConfig
                 transformer_impl.LoraConfig = lora_config_class()
                 stack.callback(setattr, transformer_impl, "LoraConfig", default_config)
@@ -291,6 +294,111 @@ def _patch_lora_build() -> None:
 
 
 _patch_lora_build()
+
+
+def _assign_full_params(model, full: dict) -> int:
+    """Copy full tensors into a (FSDP1 or FSDP2) model's parameters by name; returns how many were set."""
+    import torch
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    def clean(name: str) -> str:
+        return name.replace("_fsdp_wrapped_module.", "").replace("_checkpoint_wrapped_module.", "")
+
+    assigned = 0
+    with torch.no_grad():
+        if any(isinstance(p, DTensor) for p in model.parameters()):  # FSDP2
+            for name, param in model.named_parameters():
+                tensor = full.get(clean(name))
+                if tensor is None:
+                    continue
+                local = distribute_tensor(
+                    tensor.to(param.device, param.dtype), param.device_mesh, param.placements, src_data_rank=None
+                ).to_local()
+                param.to_local().copy_(local)
+                assigned += 1
+            return assigned
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        prefixes = {id(module): name for name, module in model.named_modules()}
+        for unit in FSDP.fsdp_modules(model):  # each LoRA leaf is its own FSDP1 unit
+            with FSDP.summon_full_params(unit, recurse=False, writeback=True):
+                for name, param in unit.named_parameters():
+                    key = clean(f"{prefixes[id(unit)]}.{name}" if prefixes[id(unit)] else name)
+                    tensor = full.get(key)
+                    if tensor is not None and tuple(param.shape) == tuple(tensor.shape):
+                        param.copy_(tensor.to(param.device, param.dtype))
+                        assigned += 1
+    return assigned
+
+
+def _patch_legacy_lora_checkpoints() -> None:
+    """Resume checkpoints written before the split q/k/v LoRA (one fused ``in_proj_qkv`` LoRA).
+
+    Their adapter converts exactly (``lora_split``: ``A`` copied to q, k and v, ``B`` sliced): every
+    rank reads all ranks' model shards (one node), converts the full tensors and copies them into
+    its own parameters. The optimizer state of such a checkpoint has another parameter layout and is
+    not restored (the next step is a first Adam step from the restored weights); everything else
+    (extra state, RNG) loads as before. Checkpoints in the current layout take VeRL's own path.
+    """
+    try:
+        from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
+    except Exception:  # noqa: BLE001
+        return
+    original = FSDPCheckpointManager.load_checkpoint
+    if getattr(original, "_envloop_legacy_lora", False):
+        return
+
+    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        import os
+
+        import torch
+
+        from ..lora_split import SplitQKVLinear, convert_legacy_full, full_tensor, legacy_split_names
+
+        model_file = os.path.join(local_path or "", f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+        if local_path is None or not self.should_load_model or not os.path.isfile(model_file):
+            return original(self, local_path, hdfs_path, del_local_after_load)
+        own = torch.load(model_file, weights_only=False, map_location="cpu")
+        names = legacy_split_names(own)
+        split_layers = {
+            name.replace("_fsdp_wrapped_module.", "").removesuffix(".base_layer"): module.split_sizes
+            for name, module in self.model.named_modules()
+            if isinstance(module, SplitQKVLinear)
+        }
+        if not names or not split_layers:
+            return original(self, local_path, hdfs_path, del_local_after_load)
+        shards = [own] + [
+            torch.load(os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{rank}.pt"),
+                       weights_only=False, map_location="cpu")
+            for rank in range(self.world_size) if rank != self.rank
+        ]
+        shards.insert(self.rank, shards.pop(0))
+        full = {key: full_tensor([shard[key] for shard in shards]) for key in own}
+
+        def sizes(key: str):
+            prefix = key.split(".in_proj_qkv.")[0] + ".in_proj_qkv"
+            return split_layers[prefix]
+
+        converted = convert_legacy_full(full, names, sizes)
+        assigned = _assign_full_params(self.model, converted)
+        if assigned != len(converted):
+            raise RuntimeError(f"legacy LoRA checkpoint: set {assigned} of {len(converted)} adapter tensors")
+        logger.warning(
+            "Loaded a fused-q/k/v LoRA checkpoint from %s as separate q/k/v LoRAs (%d tensors); its optimizer "
+            "state is not restored", local_path, assigned,
+        )
+        contents = self.checkpoint_load_contents
+        self.checkpoint_load_contents = [item for item in contents if item not in ("model", "optimizer")]
+        try:
+            return original(self, local_path, hdfs_path, del_local_after_load)
+        finally:
+            self.checkpoint_load_contents = contents
+
+    load_checkpoint._envloop_legacy_lora = True
+    FSDPCheckpointManager.load_checkpoint = load_checkpoint
+
+
+_patch_legacy_lora_checkpoints()
 
 
 class TinkerServerActorRolloutRefWorker(TinkerActorRolloutRefWorker):

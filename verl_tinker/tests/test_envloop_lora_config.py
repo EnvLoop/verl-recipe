@@ -14,6 +14,7 @@
 
 """Tinker LoraConfig parity on CPU: explicit target modules, seed, reporting, vLLM backports."""
 
+import copy
 import re
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -374,3 +375,62 @@ def test_engine_lora_build_uses_split_qkv_and_restores_the_config_class():
     layer = built.base_model.model.model.layers[0].linear_attn.in_proj_qkv
     assert type(layer).__name__ == "SplitQKVLoraLinear"
     assert type(built.base_model.model.model.layers[3].self_attn.q_proj).__name__ == "Linear"
+
+
+def test_legacy_fused_checkpoint_resumes_exactly_in_the_split_layer():
+    peft = pytest.importorskip("peft")
+    from verl_tinker.lora_split import convert_legacy_full, full_tensor, legacy_split_names
+
+    torch.manual_seed(2)
+    base = _Block()
+    legacy = peft.get_peft_model(
+        copy.deepcopy(base), peft.LoraConfig(r=2, lora_alpha=32, target_modules=["in_proj_qkv", "out_proj"])
+    )
+    for name, param in legacy.named_parameters():
+        if "lora_B" in name:
+            torch.nn.init.normal_(param)
+    saved = {k: v for k, v in legacy.state_dict().items() if "lora_" in k}  # what a LoRA-only checkpoint holds
+    names = legacy_split_names(saved)
+    assert sorted(names) == ["base_model.model.linear_attn.in_proj_qkv.lora_A.default.weight",
+                             "base_model.model.linear_attn.in_proj_qkv.lora_B.default.weight"]
+    full = {key: full_tensor([value]) for key, value in saved.items()}
+    converted = convert_legacy_full(full, names, lambda key: (4, 4, 6))
+
+    split = copy.deepcopy(base)
+    mark_split_qkv(split)
+    split = peft.get_peft_model(split, lora_config_class()(r=2, lora_alpha=32, target_modules=["in_proj_qkv", "out_proj"]))
+    result = split.load_state_dict(converted, strict=False)
+    assert not result.unexpected_keys
+    x = torch.randn(3, 8)
+    torch.testing.assert_close(split(x), legacy(x))
+
+
+def test_full_tensor_merges_sharded_tensor_shards():
+    class _Meta:
+        def __init__(self, offsets, sizes):
+            self.shard_offsets, self.shard_sizes = offsets, sizes
+
+    class _Shard:
+        def __init__(self, tensor, offsets):
+            self.tensor, self.metadata = tensor, _Meta(offsets, list(tensor.shape))
+
+    class _Sharded:  # the parts of torch's ShardedTensor that full_tensor uses
+        dtype = torch.float32
+
+        def __init__(self, shards):
+            self._shards = shards
+
+        def local_shards(self):
+            return self._shards
+
+        def metadata(self):
+            return None
+
+        def size(self):
+            return (4, 3)
+
+    full = torch.arange(12.0).reshape(4, 3)
+    parts = [_Sharded([_Shard(full[:2], [0, 0])]), _Sharded([_Shard(full[2:], [2, 0])])]
+    from verl_tinker.lora_split import full_tensor
+
+    torch.testing.assert_close(full_tensor(parts), full)
