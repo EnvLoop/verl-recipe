@@ -434,3 +434,62 @@ def test_full_tensor_merges_sharded_tensor_shards():
     from verl_tinker.lora_split import full_tensor
 
     torch.testing.assert_close(full_tensor(parts), full)
+
+
+def test_legacy_optimizer_state_converts_so_the_next_step_matches_on_b():
+    """After resuming a fused checkpoint *with* its Adam state, the first step updates B exactly like the fused
+    layout would; A starts from the same moments (copied) but gets per-slice gradients, so it differs by design."""
+    peft = pytest.importorskip("peft")
+    from verl_tinker.lora_split import convert_legacy_full, convert_legacy_optimizer_state, legacy_split_names
+
+    torch.manual_seed(4)
+    base = _Block()
+    x, target = torch.randn(5, 8), torch.randn(5, 14)
+
+    def train_step(model, optimizer):
+        optimizer.zero_grad()
+        ((model(x) - target) ** 2).sum().backward()
+        optimizer.step()
+
+    legacy = peft.get_peft_model(copy.deepcopy(base), peft.LoraConfig(r=2, lora_alpha=32, target_modules=["in_proj_qkv"]))
+    legacy_params = [p for p in legacy.parameters() if p.requires_grad]
+    legacy_opt = torch.optim.AdamW(legacy_params, lr=1e-2)
+    for _ in range(3):
+        train_step(legacy, legacy_opt)
+    names = [n for n, p in legacy.named_parameters() if p.requires_grad]
+    saved_model = {n: p.detach().clone() for n, p in legacy.named_parameters() if p.requires_grad}
+    saved_opt = legacy_opt.state_dict()
+    full_states = {names[i]: saved_opt["state"][i] for i in range(len(names))}
+
+    split = copy.deepcopy(base)
+    mark_split_qkv(split)
+    split = peft.get_peft_model(split, lora_config_class()(r=2, lora_alpha=32, target_modules=["in_proj_qkv"]))
+    mapping = legacy_split_names(saved_model)
+    sizes = lambda key: (4, 4, 6)  # noqa: E731
+    split.load_state_dict(convert_legacy_full(saved_model, mapping, sizes), strict=False)
+    split_names = [n for n, p in split.named_parameters() if p.requires_grad]
+    split_opt = torch.optim.AdamW([p for p in split.parameters() if p.requires_grad], lr=1e-2)
+    new_states = convert_legacy_optimizer_state(full_states, mapping, sizes)
+    split_opt.load_state_dict({"state": {i: new_states[n] for i, n in enumerate(split_names)},
+                               "param_groups": split_opt.state_dict()["param_groups"]})
+    torch.testing.assert_close(split(x), legacy(x))
+
+    train_step(legacy, legacy_opt)
+    train_step(split, split_opt)
+    fused_b = legacy.base_model.model.linear_attn.in_proj_qkv.lora_B["default"].weight
+    split_b = split.base_model.model.linear_attn.in_proj_qkv.lora_B["default"]
+    torch.testing.assert_close(torch.cat([split_b.q.weight, split_b.k.weight, split_b.v.weight]), fused_b,
+                               rtol=0, atol=1e-6)
+    assert all(split_opt.state[p]["step"] == 4 for p in split_opt.state)
+
+
+def test_fsdp1_optimizer_state_round_trips_through_flat_rank_views():
+    from verl_tinker.backends.colocated import _full_state_value, _local_state_value
+
+    full = torch.arange(15.0).reshape(5, 3)  # 15 elements over 2 ranks: chunks of 8 (padded to 16)
+    views = [full.reshape(-1)[:8], full.reshape(-1)[8:]]
+    torch.testing.assert_close(_full_state_value(views, (5, 3)), full)
+    for rank, view in enumerate(views):
+        param = torch.empty(view.shape)
+        torch.testing.assert_close(_local_state_value(full, param, 2, rank), view)
+    assert _full_state_value([torch.tensor(3.0), torch.tensor(3.0)], (5, 3)).item() == 3.0

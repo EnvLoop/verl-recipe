@@ -335,18 +335,44 @@ def test_legacy_fused_checkpoint_round_trip(server, model):
             _forward_backward(head, model, datum)
             _optim(head, model, lr=1e-3, eps=1e-8)
         path = head.call("/api/v1/save_weights", {"model_id": model["model_id"], "path": "legacy-ckpt"})["path"]
-        record.write_text(json.dumps({"path": path, "logprobs": _actor_logprobs(head, model, tokens).tolist()}))
+        logprobs = _actor_logprobs(head, model, tokens).tolist()
+        _forward_backward(head, model, datum)  # the step a resume with optimizer state must reproduce
+        _optim(head, model, lr=1e-3, eps=1e-8)
+        _, after_step = _export(server, model, "legacy-next")
+        torch.save(after_step, record.with_suffix(".next.pt"))
+        record.write_text(json.dumps({"path": path, "logprobs": logprobs}))
         print(f"RESULT legacy_saved path={path}")
         return
     saved = json.loads(record.read_text())
     before = _actor_logprobs(head, model, tokens)
-    head.call("/api/v1/load_weights", {"model_id": model["model_id"], "path": saved["path"], "optimizer": False})
+    head.call("/api/v1/load_weights", {"model_id": model["model_id"], "path": saved["path"], "optimizer": True})
     after = _actor_logprobs(head, model, tokens)
     expected = torch.tensor(saved["logprobs"], dtype=torch.float64)
     diff = (after - expected).abs()
     print(f"RESULT legacy_resume mean_abs={diff.mean().item():.5f} max_abs={diff.max().item():.5f} "
           f"untrained_vs_saved={(before - expected).abs().mean().item():.4f}")
     assert diff.max().item() < 0.05
+    # Resumed with the converted Adam state, the next step moves every tensor but the GDN A's exactly like
+    # the fused layout did (A's get per-slice gradients by design).
+    datum = _datum(tokens, weights=_tensor([0.0] * (len(PROMPT) - 1) + [1.0] * len(COMPLETION)))
+    _forward_backward(head, model, datum)
+    _optim(head, model, lr=1e-3, eps=1e-8)
+    _, split_next = _export(server, model, "split-next")
+    fused_next = torch.load(record.with_suffix(".next.pt"))
+    worst, compared = 0.0, 0
+    for name, fused in fused_next.items():
+        if ".in_proj_qkv.lora_A." in name:
+            continue
+        if ".in_proj_qkv.lora_B." in name:
+            prefix = name.split(".in_proj_qkv.")[0]
+            split = torch.cat([split_next[f"{prefix}.in_proj_{s}.lora_B.weight"] for s in "qkv"])
+        else:
+            split = split_next[name]
+        scale = fused.float().abs().max().item() or 1.0
+        worst = max(worst, (split.float() - fused.float()).abs().max().item() / scale)
+        compared += 1
+    print(f"RESULT legacy_next_step tensors={compared} max_rel_diff={worst:.2e}")
+    assert worst < 2e-2
     # The rollout gets the converted adapter too.
     sampled = _sampler_vs_actor(head, model, 20)
     print(f"RESULT legacy_resume_sampler_vs_actor {sampled}")

@@ -230,8 +230,33 @@ def convert_legacy_full(full: Mapping[str, torch.Tensor], names: Mapping[str, li
     return out
 
 
+def convert_legacy_optimizer_state(
+    full_states: Mapping[str, Mapping[str, object]], names: Mapping[str, list[str]], split_sizes
+) -> dict:
+    """Per-parameter Adam state of a legacy checkpoint (full tensors, keyed by parameter name) -> the split layer's.
+
+    ``B``'s moments are sliced like ``B``; ``A``'s moments are copied to q, k and v (``A`` itself is copied,
+    so this is the equivalent state); ``step`` and other scalars are kept. Other parameters are unchanged.
+    """
+    out = {}
+    for key, state in full_states.items():
+        targets = names.get(key)
+        if targets is None:
+            out[key] = dict(state)
+            continue
+        per_slice = [dict() for _ in targets]
+        for field, value in state.items():
+            is_moment = isinstance(value, torch.Tensor) and value.dim() == 2
+            parts = value.split(list(split_sizes(key)), dim=0) if is_moment and ".lora_B" in key else [value] * 3
+            for slot, part in zip(per_slice, parts, strict=True):
+                slot[field] = part.clone() if isinstance(part, torch.Tensor) else part
+        out.update(zip(targets, per_slice, strict=True))
+    return out
+
+
 __all__ = [
     "convert_legacy_full",
+    "convert_legacy_optimizer_state",
     "full_tensor",
     "legacy_split_names",
     "SplitQKVLinear",
