@@ -210,7 +210,10 @@ def full_tensor(parts: list) -> torch.Tensor:
         full = torch.zeros(tuple(first.size()), dtype=first.dtype)
         for part in parts:
             for shard in part.local_shards():
-                index = tuple(slice(o, o + n) for o, n in zip(shard.metadata.shard_offsets, shard.metadata.shard_sizes))
+                index = tuple(
+                    slice(o, o + n)
+                    for o, n in zip(shard.metadata.shard_offsets, shard.metadata.shard_sizes, strict=True)
+                )
                 full[index] = shard.tensor.to("cpu")
         return full
     return first

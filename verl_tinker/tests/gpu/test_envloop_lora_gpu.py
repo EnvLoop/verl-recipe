@@ -154,7 +154,9 @@ def _export(server, model, name: str) -> tuple[dict, dict[str, torch.Tensor]]:
     spec = importlib.util.spec_from_file_location("lora_export", os.environ["LORA_GPU_LORA_EXPORT"])
     lora_export = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(lora_export)
-    shards = lora_export._load_shards(tags[0], int(json.loads((tags[0] / "fsdp_config.json").read_text())["world_size"]))
+    shards = lora_export._load_shards(
+        tags[0], int(json.loads((tags[0] / "fsdp_config.json").read_text())["world_size"])
+    )
     visual = [key for key in shards[0] if "lora_" in key and ".visual." in key]
     assert visual == [], visual[:3]
     out = lora_export.export(tags[0])
@@ -226,7 +228,10 @@ def _actor_logprobs(head, model, tokens: list[int]) -> torch.Tensor:
     datum = _datum(tokens, weights=_tensor([1.0] * (len(tokens) - 1)))
     result = head.call(
         "/api/v1/forward",
-        {"forward_input": {"data": [datum], "loss_fn": "cross_entropy", "loss_fn_config": None}, "model_id": model["model_id"]},
+        {
+            "forward_input": {"data": [datum], "loss_fn": "cross_entropy", "loss_fn_config": None},
+            "model_id": model["model_id"],
+        },
     )
     return torch.tensor(result["loss_fn_outputs"][0]["logprobs"]["data"], dtype=torch.float64)
 
@@ -278,7 +283,9 @@ def test_rollout_samples_from_the_trained_adapter(server, model):
         # The trained adapter as EnvPlatform publishes it, plus the actor's logprobs, so a
         # serving engine can be checked against the trainer (e.g. vLLM 0.31 with this adapter).
         _export(server, model, "lora-final")
-        tags = [path.parent for path in server["checkpoints"].rglob("lora_train_meta.json") if "lora-final" in str(path)]
+        tags = [
+            path.parent for path in server["checkpoints"].rglob("lora_train_meta.json") if "lora-final" in str(path)
+        ]
         Path(dump).write_text(
             json.dumps(
                 {
@@ -365,8 +372,10 @@ def test_legacy_fused_checkpoint_round_trip(server, model):
     after = _actor_logprobs(head, model, tokens)
     expected = torch.tensor(saved["logprobs"], dtype=torch.float64)
     diff = (after - expected).abs()
-    print(f"RESULT legacy_resume mean_abs={diff.mean().item():.5f} max_abs={diff.max().item():.5f} "
-          f"untrained_vs_saved={(before - expected).abs().mean().item():.4f}")
+    print(
+        f"RESULT legacy_resume mean_abs={diff.mean().item():.5f} max_abs={diff.max().item():.5f} "
+        f"untrained_vs_saved={(before - expected).abs().mean().item():.4f}"
+    )
     assert diff.max().item() < 0.05
     # Resumed with the converted Adam state, the next step moves every tensor but the GDN A's exactly like
     # the fused layout did (A's get per-slice gradients by design).

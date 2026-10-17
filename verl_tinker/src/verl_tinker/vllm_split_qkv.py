@@ -32,11 +32,20 @@ No upstream vLLM version supports per-slice LoRAs on this layer by name (checked
 
 from __future__ import annotations
 
+import importlib.metadata
 import logging
+import os
+import pathlib
 
 logger = logging.getLogger(__name__)
 
 SPLIT = ("in_proj_q", "in_proj_k", "in_proj_v")
+ENTRY_POINT = f"{__name__}:register"
+# What the patches rely on in the installed vLLM tree (relative to the ``vllm`` package).
+HOOKS = {
+    "model_executor/models/qwen3_5.py": '"in_proj_qkvz"',
+    "lora/model_manager.py": "def _create_merged_loras_inplace(",
+}
 PACKED = [*SPLIT, "in_proj_z", "in_proj_qkv"]
 
 
@@ -101,3 +110,19 @@ def register() -> None:
     except ImportError:  # a vLLM without Qwen3.5 or LoRA support has nothing to patch
         return
     logger.info("verl_tinker: per-slice q/k/v LoRA enabled for Qwen3.5 in_proj_qkvz")
+
+
+def enabled(vllm_root: pathlib.Path | None) -> bool:
+    """vLLM will run ``register`` in its engine-core and worker processes. Reads metadata and files only.
+
+    True when this package's ``vllm.general_plugins`` entry point is installed, ``VLLM_PLUGINS`` (vLLM's
+    allowlist; unset loads every plugin) does not exclude it, and the installed vLLM has the hooks it patches.
+    """
+    names = [ep.name for ep in importlib.metadata.entry_points(group="vllm.general_plugins") if ep.value == ENTRY_POINT]
+    allowed = os.environ.get("VLLM_PLUGINS")
+    if not names or (allowed is not None and not set(names) & set(allowed.split(","))):
+        return False
+    return vllm_root is not None and all(
+        (vllm_root / relative).is_file() and marker in (vllm_root / relative).read_text()
+        for relative, marker in HOOKS.items()
+    )

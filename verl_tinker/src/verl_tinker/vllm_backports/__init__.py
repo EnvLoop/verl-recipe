@@ -112,7 +112,12 @@ def present(root: pathlib.Path, version: str, fixes=FIXES) -> bool:
 
 
 def find_installed() -> bool:
-    return _installed_root_and_version()[0] is not None
+    return installed_root() is not None
+
+
+def installed_root() -> pathlib.Path | None:
+    """The installed ``vllm`` package directory, without importing vLLM."""
+    return _installed_root_and_version()[0]
 
 
 def present_installed() -> bool:

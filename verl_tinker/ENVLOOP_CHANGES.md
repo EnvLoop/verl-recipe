@@ -506,6 +506,13 @@ end to end (EnvPlatform: `lora_targets.py`, guest overlay; this repo: the pieces
   value as `capabilities: {"lm_head_lora_prompt_logprobs": bool}` in `get_info` and
   `get_server_capabilities` (re-checked from the installed files, so it holds in every process).
   EnvLoop's gateway uses it to decide whether a head may sample adapters with an `lm_head` LoRA.
+* **Capability `lora_split_qkv`.** `verl_tinker.capabilities.LORA_SPLIT_QKV = True` declares that the rollout's
+  vLLM serves adapters with separate `in_proj_{q,k,v}` LoRAs via the `vllm_split_qkv` general plugin. The head
+  reports `capabilities.lora_split_qkv` in `get_info` / `get_server_capabilities` as True only when vLLM will load
+  the plugin in its engine and worker processes: this package's `vllm.general_plugins` entry point is installed,
+  `VLLM_PLUGINS` (vLLM's allowlist) does not exclude it, and the installed vLLM has the hooks it patches (read from
+  files, no vLLM import). `verl_tinker.start` refuses to start if it is declared but would not load. EnvLoop's
+  gateway sends checkpoints with `in_proj_q/k/v` targets to a head only when this is True.
 * Non-power-of-two ranks work in the backend (vLLM zero-pads the adapter into
   `max_lora_rank`, the next value of `MaxLoRARanks`); EnvLoop still only accepts Tinker's
   powers of two.

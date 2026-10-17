@@ -24,7 +24,7 @@ import torch
 from fastapi import HTTPException
 from omegaconf import OmegaConf
 from test_envloop_router_alignment import _server
-from verl_tinker import capabilities, vllm_backports
+from verl_tinker import capabilities, vllm_backports, vllm_split_qkv
 from verl_tinker.backends.colocated import lora_init_seed
 from verl_tinker.lora_info import configured_lora_info
 from verl_tinker.lora_split import lora_config_class, mark_split_qkv, split_legacy_tensors, split_peft_name
@@ -45,15 +45,33 @@ TINKER_PER_RANK = {
 _LAYERS_4B = ["linear_attention"] * 3 + ["full_attention"]
 TEXT_CONFIGS = {
     "Qwen/Qwen3.5-4B": dict(
-        hidden_size=2560, intermediate_size=9216, num_hidden_layers=32, layer_types=_LAYERS_4B * 8,
-        num_attention_heads=16, num_key_value_heads=4, head_dim=256, linear_num_key_heads=16,
-        linear_num_value_heads=32, linear_key_head_dim=128, linear_value_head_dim=128, vocab_size=248320,
+        hidden_size=2560,
+        intermediate_size=9216,
+        num_hidden_layers=32,
+        layer_types=_LAYERS_4B * 8,
+        num_attention_heads=16,
+        num_key_value_heads=4,
+        head_dim=256,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        vocab_size=248320,
         tie_word_embeddings=True,
     ),
     "Qwen/Qwen3.8-27B": dict(
-        hidden_size=5120, intermediate_size=17408, num_hidden_layers=64, layer_types=_LAYERS_4B * 16,
-        num_attention_heads=24, num_key_value_heads=4, head_dim=256, linear_num_key_heads=16,
-        linear_num_value_heads=48, linear_key_head_dim=128, linear_value_head_dim=128, vocab_size=248320,
+        hidden_size=5120,
+        intermediate_size=17408,
+        num_hidden_layers=64,
+        layer_types=_LAYERS_4B * 16,
+        num_attention_heads=24,
+        num_key_value_heads=4,
+        head_dim=256,
+        linear_num_key_heads=16,
+        linear_num_value_heads=48,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        vocab_size=248320,
         tie_word_embeddings=False,
     ),
 }
@@ -191,7 +209,11 @@ def _peft_engine_self(seed, target_modules):
 def _tiny_module():
     transformers = pytest.importorskip("transformers")
     config = transformers.Qwen2Config(
-        hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
         vocab_size=128,
     )
     torch.manual_seed(0)
@@ -264,14 +286,50 @@ def test_capability_reports_only_verified_backports(tmp_path, monkeypatch):
                 handle.write("".join(f"{old}# --\n" for old, _ in file_hunks))
     assert vllm_backports.present(root, "0.26.0") is False
     monkeypatch.setattr(vllm_backports, "_installed_root_and_version", lambda: (root, "0.26.0"))
+    monkeypatch.setattr(vllm_split_qkv, "enabled", lambda vllm_root: vllm_root == root)
     with pytest.raises(vllm_backports.BackportError):
         capabilities.assert_startup_capabilities()
-    assert capabilities.runtime_capabilities() == {"lm_head_lora_prompt_logprobs": False}
+    assert capabilities.runtime_capabilities() == {"lm_head_lora_prompt_logprobs": False, "lora_split_qkv": True}
 
     vllm_backports.apply_installed()
     capabilities.assert_startup_capabilities()
-    assert capabilities.runtime_capabilities() == {"lm_head_lora_prompt_logprobs": True}
+    assert capabilities.runtime_capabilities() == {"lm_head_lora_prompt_logprobs": True, "lora_split_qkv": True}
     assert vllm_backports.present(root, "9.9.9")  # a release without diffs ships the fixes
+    capabilities.runtime_capabilities.cache_clear()
+
+
+def test_split_qkv_capability_needs_the_plugin_loaded(tmp_path, monkeypatch):
+    from importlib.metadata import EntryPoint
+
+    root = tmp_path / "vllm"
+    for relative, marker in vllm_split_qkv.HOOKS.items():
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_text(f"x = 1\n{marker}\n")
+    plugin = EntryPoint("verl_tinker_split_qkv_lora", vllm_split_qkv.ENTRY_POINT, "vllm.general_plugins")
+    installed = [plugin]
+    monkeypatch.setattr(vllm_split_qkv.importlib.metadata, "entry_points", lambda group: list(installed))
+    monkeypatch.delenv("VLLM_PLUGINS", raising=False)
+    assert vllm_split_qkv.enabled(root)
+    assert not vllm_split_qkv.enabled(None)  # no vLLM
+    monkeypatch.setenv("VLLM_PLUGINS", "some_other_plugin")
+    assert not vllm_split_qkv.enabled(root)  # excluded by vLLM's plugin allowlist
+    monkeypatch.setenv("VLLM_PLUGINS", "some_other_plugin,verl_tinker_split_qkv_lora")
+    assert vllm_split_qkv.enabled(root)
+    (root / "lora/model_manager.py").write_text("x = 1\n")
+    assert not vllm_split_qkv.enabled(root)  # a vLLM without the hook the plugin wraps
+    (root / "lora/model_manager.py").write_text(vllm_split_qkv.HOOKS["lora/model_manager.py"])
+    installed.clear()
+    assert not vllm_split_qkv.enabled(root)  # package installed without its entry point
+
+    monkeypatch.setattr(vllm_backports, "_installed_root_and_version", lambda: (root, "9.9.9"))
+    monkeypatch.setattr(vllm_backports, "present_installed", lambda: True)
+    capabilities.runtime_capabilities.cache_clear()
+    with pytest.raises(vllm_backports.BackportError, match="split q/k/v"):
+        capabilities.assert_startup_capabilities()
+    assert capabilities.runtime_capabilities()["lora_split_qkv"] is False
+    installed.append(plugin)
+    capabilities.assert_startup_capabilities()
+    assert capabilities.runtime_capabilities()["lora_split_qkv"] is True
     capabilities.runtime_capabilities.cache_clear()
 
 
@@ -321,9 +379,12 @@ def test_split_qkv_lora_is_three_independent_loras_on_the_fused_linear():
     shapes = {name: tuple(p.shape) for name, p in model.named_parameters() if p.requires_grad}
     prefix = "base_model.model.linear_attn.in_proj_qkv"
     assert shapes == {
-        f"{prefix}.lora_A.default.q.weight": (2, 8), f"{prefix}.lora_A.default.k.weight": (2, 8),
-        f"{prefix}.lora_A.default.v.weight": (2, 8), f"{prefix}.lora_B.default.q.weight": (4, 2),
-        f"{prefix}.lora_B.default.k.weight": (4, 2), f"{prefix}.lora_B.default.v.weight": (6, 2),
+        f"{prefix}.lora_A.default.q.weight": (2, 8),
+        f"{prefix}.lora_A.default.k.weight": (2, 8),
+        f"{prefix}.lora_A.default.v.weight": (2, 8),
+        f"{prefix}.lora_B.default.q.weight": (4, 2),
+        f"{prefix}.lora_B.default.k.weight": (4, 2),
+        f"{prefix}.lora_B.default.v.weight": (6, 2),
     }
     # Each A is initialised like PEFT's / nn.Linear's (independently, not copies).
     assert not torch.equal(lora_a.q.weight, lora_a.k.weight)
@@ -335,9 +396,7 @@ def test_split_names_and_legacy_fused_adapters_convert_exactly():
 
     model, _ = _split_model()
     names = sorted(split_peft_name(name) for name in get_peft_model_state_dict(model))
-    assert names == sorted(
-        f"base_model.model.linear_attn.in_proj_{s}.lora_{ab}.weight" for ab in "AB" for s in "qkv"
-    )
+    assert names == sorted(f"base_model.model.linear_attn.in_proj_{s}.lora_{ab}.weight" for ab in "AB" for s in "qkv")
     assert split_peft_name("x.out_proj.lora_A.weight") == "x.out_proj.lora_A.weight"
 
     # A legacy adapter: one LoRA on the fused Linear (shared A).
@@ -345,13 +404,16 @@ def test_split_names_and_legacy_fused_adapters_convert_exactly():
     legacy = peft.get_peft_model(_GDN(), peft.LoraConfig(r=2, lora_alpha=32, target_modules=["in_proj_qkv"]))
     fused = legacy.base_model.model.in_proj_qkv
     torch.nn.init.normal_(fused.lora_B["default"].weight)
-    tensors = {"m.in_proj_qkv.lora_A.weight": fused.lora_A["default"].weight.detach(),
-               "m.in_proj_qkv.lora_B.weight": fused.lora_B["default"].weight.detach()}
+    tensors = {
+        "m.in_proj_qkv.lora_A.weight": fused.lora_A["default"].weight.detach(),
+        "m.in_proj_qkv.lora_B.weight": fused.lora_B["default"].weight.detach(),
+    }
     split = split_legacy_tensors(tensors, (4, 4, 6))
     assert sorted(split) == sorted(f"m.in_proj_{s}.lora_{ab}.weight" for ab in "AB" for s in "qkv")
     x = torch.randn(3, 8)
-    delta = torch.cat([x @ split[f"m.in_proj_{s}.lora_A.weight"].T @ split[f"m.in_proj_{s}.lora_B.weight"].T
-                       for s in "qkv"], dim=-1)
+    delta = torch.cat(
+        [x @ split[f"m.in_proj_{s}.lora_A.weight"].T @ split[f"m.in_proj_{s}.lora_B.weight"].T for s in "qkv"], dim=-1
+    )
     torch.testing.assert_close(delta * 16.0, legacy(x) - fused.base_layer(x))
 
 
@@ -362,9 +424,18 @@ def test_engine_lora_build_uses_split_qkv_and_restores_the_config_class():
     if getattr(transformers, "Qwen3_5TextConfig", None) is None:
         pytest.skip("transformers without Qwen3.5")
     config = transformers.Qwen3_5TextConfig(
-        hidden_size=64, intermediate_size=128, num_hidden_layers=4, layer_types=_LAYERS_4B,
-        num_attention_heads=4, num_key_value_heads=2, head_dim=16, linear_num_key_heads=2,
-        linear_num_value_heads=4, linear_key_head_dim=16, linear_value_head_dim=16, vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        layer_types=_LAYERS_4B,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        vocab_size=256,
     )
     with torch.device("meta"):
         model = transformers.Qwen3_5ForCausalLM(config)
@@ -391,14 +462,18 @@ def test_legacy_fused_checkpoint_resumes_exactly_in_the_split_layer():
             torch.nn.init.normal_(param)
     saved = {k: v for k, v in legacy.state_dict().items() if "lora_" in k}  # what a LoRA-only checkpoint holds
     names = legacy_split_names(saved)
-    assert sorted(names) == ["base_model.model.linear_attn.in_proj_qkv.lora_A.default.weight",
-                             "base_model.model.linear_attn.in_proj_qkv.lora_B.default.weight"]
+    assert sorted(names) == [
+        "base_model.model.linear_attn.in_proj_qkv.lora_A.default.weight",
+        "base_model.model.linear_attn.in_proj_qkv.lora_B.default.weight",
+    ]
     full = {key: full_tensor([value]) for key, value in saved.items()}
     converted = convert_legacy_full(full, names, lambda key: (4, 4, 6))
 
     split = copy.deepcopy(base)
     mark_split_qkv(split)
-    split = peft.get_peft_model(split, lora_config_class()(r=2, lora_alpha=32, target_modules=["in_proj_qkv", "out_proj"]))
+    split = peft.get_peft_model(
+        split, lora_config_class()(r=2, lora_alpha=32, target_modules=["in_proj_qkv", "out_proj"])
+    )
     result = split.load_state_dict(converted, strict=False)
     assert not result.unexpected_keys
     x = torch.randn(3, 8)
@@ -451,7 +526,9 @@ def test_legacy_optimizer_state_converts_so_the_next_step_matches_on_b():
         ((model(x) - target) ** 2).sum().backward()
         optimizer.step()
 
-    legacy = peft.get_peft_model(copy.deepcopy(base), peft.LoraConfig(r=2, lora_alpha=32, target_modules=["in_proj_qkv"]))
+    legacy = peft.get_peft_model(
+        copy.deepcopy(base), peft.LoraConfig(r=2, lora_alpha=32, target_modules=["in_proj_qkv"])
+    )
     legacy_params = [p for p in legacy.parameters() if p.requires_grad]
     legacy_opt = torch.optim.AdamW(legacy_params, lr=1e-2)
     for _ in range(3):
@@ -470,16 +547,21 @@ def test_legacy_optimizer_state_converts_so_the_next_step_matches_on_b():
     split_names = [n for n, p in split.named_parameters() if p.requires_grad]
     split_opt = torch.optim.AdamW([p for p in split.parameters() if p.requires_grad], lr=1e-2)
     new_states = convert_legacy_optimizer_state(full_states, mapping, sizes)
-    split_opt.load_state_dict({"state": {i: new_states[n] for i, n in enumerate(split_names)},
-                               "param_groups": split_opt.state_dict()["param_groups"]})
+    split_opt.load_state_dict(
+        {
+            "state": {i: new_states[n] for i, n in enumerate(split_names)},
+            "param_groups": split_opt.state_dict()["param_groups"],
+        }
+    )
     torch.testing.assert_close(split(x), legacy(x))
 
     train_step(legacy, legacy_opt)
     train_step(split, split_opt)
     fused_b = legacy.base_model.model.linear_attn.in_proj_qkv.lora_B["default"].weight
     split_b = split.base_model.model.linear_attn.in_proj_qkv.lora_B["default"]
-    torch.testing.assert_close(torch.cat([split_b.q.weight, split_b.k.weight, split_b.v.weight]), fused_b,
-                               rtol=0, atol=1e-6)
+    torch.testing.assert_close(
+        torch.cat([split_b.q.weight, split_b.k.weight, split_b.v.weight]), fused_b, rtol=0, atol=1e-6
+    )
     assert all(split_opt.state[p]["step"] == 4 for p in split_opt.state)
 
 
@@ -523,11 +605,16 @@ def test_legacy_optimizer_load_maps_verl_whole_model_param_order(tmp_path):
     _load_legacy_optimizer(manager, str(tmp_path), full, legacy_split_names(full), lambda key: (4, 4, 6))
 
     by_name = {n: p for n, p in split.named_parameters()}
-    fused_state = legacy_opt.state[dict(legacy.named_parameters())[
-        "base_model.model.linear_attn.in_proj_qkv.lora_B.default.weight"]]
+    fused_state = legacy_opt.state[
+        dict(legacy.named_parameters())["base_model.model.linear_attn.in_proj_qkv.lora_B.default.weight"]
+    ]
     q_state = split_opt.state[by_name["base_model.model.linear_attn.in_proj_qkv.lora_B.default.q.weight"]]
     torch.testing.assert_close(q_state["exp_avg"], fused_state["exp_avg"][:4])
     out_state = split_opt.state[by_name["base_model.model.linear_attn.out_proj.lora_A.default.weight"]]
-    torch.testing.assert_close(out_state["exp_avg_sq"], legacy_opt.state[dict(legacy.named_parameters())[
-        "base_model.model.linear_attn.out_proj.lora_A.default.weight"]]["exp_avg_sq"])
+    torch.testing.assert_close(
+        out_state["exp_avg_sq"],
+        legacy_opt.state[
+            dict(legacy.named_parameters())["base_model.model.linear_attn.out_proj.lora_A.default.weight"]
+        ]["exp_avg_sq"],
+    )
     assert not split_opt.state[by_name["base_model.model.linear_attn.out_proj.base_layer.weight"]]
