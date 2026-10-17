@@ -475,9 +475,13 @@ end to end (EnvPlatform: `lora_targets.py`, guest overlay; this repo: the pieces
   `in_proj_qkv` LoRA exactly (A copied, B sliced) and keeps the four slice entries. Works on vLLM
   0.26 (rollout) and 0.31 (the sampling pool must load it too).
 * **Old checkpoints.** A checkpoint with fused `in_proj_qkv` LoRAs loads into the split layer
-  exactly (`FSDPCheckpointManager.load_checkpoint` patch: every rank reads all ranks' shards,
-  converts the full tensors and copies them into its FSDP1 / FSDP2 parameters). Its optimizer
-  state (another parameter layout) is not restored; the next step is a first Adam step.
+  exactly (`FSDPCheckpointManager.load_checkpoint` patch: every rank reads all ranks' model and
+  optimizer shards, converts the full tensors and copies them into its FSDP1 / FSDP2 parameters and
+  optimizer). Adam state: `B`'s `exp_avg` / `exp_avg_sq` are sliced like `B`, `A`'s copied to q, k
+  and v, `step` kept; VeRL's optimizer holds every parameter (frozen ones without state), indexed
+  in `named_parameters` order, which the loader rebuilds for the legacy layout. Exact: weights,
+  moments, and the next step's update of `B` and of every other LoRA tensor (CPU test with PEFT +
+  AdamW). Not equal by design: `A`'s updates from then on (each slice gets its own gradient).
 * **Seed.** `actor_rollout_ref.model.lora.seed` (EnvLoop: `TINKER_LORA_SEED`) seeds the
   RNGs around VeRL's `FSDPEngine._build_lora_module` (patched at import in
   `backends/colocated.py`, like the IPC patch); rank 0's initialised adapter is what FSDP
@@ -566,6 +570,8 @@ Split q/k/v LoRAs (2026-10-17, 1x H100, Qwen3.5-4B, fused log-prob kernels on):
 | Qwen3.8-27B (2x H200, FSDP1, TP2), rank 8, all layers: exported adapter | 60,354,560 parameters = 8 x 7,544,320 (the reference's 27B rank-8 count) |
 | same, fused-q/k/v checkpoint resumed by a split server (FSDP1 path) | actor logprobs identical (max diff 0.00000) |
 | same, sampler vs actor / prompt logprobs vs actor (layered sync + safetensors) | 0.023 / 0.027 mean |
+| Qwen3.8-27B, production path of the long-context branch (2x H200 SXM NVLink, FSDP2, SP2, fused kernels, layered off, dummy, 64K) | first sampler save fine; exported 60,354,560 (= reference); sampler vs actor 0.018, prompt logprobs 0.042; peak 75.5 GB/card; seed digest identical to the FSDP1 run |
+| Qwen3.5-4B (FSDP2): fused checkpoint saved with Adam state, one more step; split server loads with `optimizer: true` and takes the same step | weights identical; per-tensor update error vs the fused run median 1.0%, max 2.8% over 378 tensors (bf16; a step without the restored moments would differ by O(1)) |
 
 The 27B sampler rows needed `layered_summon: true` + `load_format: safetensors`: with the production 27B
 setting (layered off, dummy load) the first sampler save OOMs on 2x H200 regardless of this change (also

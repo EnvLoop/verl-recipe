@@ -161,6 +161,22 @@ def _export(server, model, name: str) -> tuple[dict, dict[str, torch.Tensor]]:
     return json.loads((out / "adapter_config.json").read_text()), load_file(str(out / "adapter_model.safetensors"))
 
 
+def _exported_tensors(server, name: str) -> dict[str, torch.Tensor]:
+    """The PEFT tensors of an existing checkpoint (exported with EnvPlatform's lora_export if needed)."""
+    import importlib.util
+
+    from safetensors.torch import load_file
+
+    tags = [path.parent for path in server["checkpoints"].rglob("lora_train_meta.json") if name in str(path)]
+    assert len(tags) == 1, tags
+    if not (tags[0] / "lora_adapter").exists():
+        spec = importlib.util.spec_from_file_location("lora_export", os.environ["LORA_GPU_LORA_EXPORT"])
+        lora_export = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lora_export)
+        lora_export.export(tags[0])
+    return load_file(str(tags[0] / "lora_adapter" / "adapter_model.safetensors"))
+
+
 def test_init_digest_and_reported_adapter(server, model):
     head = server["head"]
     info = head.post("/api/v1/get_info", {"model_id": model["model_id"]})
@@ -359,20 +375,24 @@ def test_legacy_fused_checkpoint_round_trip(server, model):
     _optim(head, model, lr=1e-3, eps=1e-8)
     _, split_next = _export(server, model, "split-next")
     fused_next = torch.load(record.with_suffix(".next.pt"))
-    worst, compared = 0.0, 0
+    fused_before = _exported_tensors(server, "legacy-ckpt")
+    errors = []
     for name, fused in fused_next.items():
-        if ".in_proj_qkv.lora_A." in name:
+        if ".in_proj_qkv.lora_A." in name:  # A's get per-slice gradients by design
             continue
         if ".in_proj_qkv.lora_B." in name:
             prefix = name.split(".in_proj_qkv.")[0]
             split = torch.cat([split_next[f"{prefix}.in_proj_{s}.lora_B.weight"] for s in "qkv"])
         else:
             split = split_next[name]
-        scale = fused.float().abs().max().item() or 1.0
-        worst = max(worst, (split.float() - fused.float()).abs().max().item() / scale)
-        compared += 1
-    print(f"RESULT legacy_next_step tensors={compared} max_rel_diff={worst:.2e}")
-    assert worst < 2e-2
+        before = fused_before[name].float()
+        fused_step, split_step = fused.float() - before, split.float() - before
+        errors.append(((split_step - fused_step).norm() / fused_step.norm().clamp_min(1e-12)).item())
+    errors.sort()
+    median, worst = errors[len(errors) // 2], errors[-1]
+    print(f"RESULT legacy_next_step tensors={len(errors)} update_rel_err median={median:.3f} max={worst:.3f}")
+    # bf16 noise is ~1-3%; an Adam step without the restored moments differs by O(1).
+    assert median < 0.03 and worst < 0.1
     # The rollout gets the converted adapter too.
     sampled = _sampler_vs_actor(head, model, 20)
     print(f"RESULT legacy_resume_sampler_vs_actor {sampled}")
