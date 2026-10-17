@@ -296,3 +296,14 @@ weights (`ModelResourceManager.resolve_resource` returns `ROLLOUT`), so the two 
 engines: EnvLoop prod e2e Qwen3.5-4B max abs diff 0.084 (was exactly 0.0 with the sampler pass), and the
 recipe GPU suite failed on A100. The scalar pass is back on the sampler. The 0.118 gap first seen on
 Qwen3.8-27B (2× B200, TP 2) is between two sampler passes and is tracked separately.
+
+## Tensor-parallel vLLM rollout all-reduces through NCCL by default
+
+vLLM's custom all-reduce writes to the peer GPU through CUDA IPC handles after a P2P probe that can pass
+on hosts where those kernel stores fault. On a rented 2× H100 box without NVLink (EnvLoop prod
+2026-10-17, Qwen3.8-27B, rollout TP 2), vLLM's CUDA-graph memory profiling hit "an illegal memory
+access" and `EngineCore failed to start`. Another 2× H100 host ran the same config fine. For a vLLM
+rollout with `tensor_model_parallel_size > 1`, `config_utils` now sets
+`rollout.engine_kwargs.vllm.disable_custom_all_reduce: true` unless the config sets it, so NCCL picks a
+working transport itself. Upstream's own TP-2 config (`configs/advance/qwen3_8b_actor_rollout_lora.yaml`)
+already sets this. TP 1 rollouts have no all-reduce and are unchanged.

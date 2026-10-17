@@ -200,6 +200,25 @@ def test_tinker_config_disables_verl_model_offload_flags():
     assert config.actor_rollout_ref.ref.veomni.optimizer_offload is False
 
 
+@pytest.mark.parametrize(
+    "rollout,expected",
+    [
+        ({"name": "vllm", "tensor_model_parallel_size": 2}, True),
+        ({"name": "vllm", "tensor_model_parallel_size": 2, "engine_kwargs": {"vllm": {"disable_custom_all_reduce": False}}}, False),
+        ({"name": "vllm", "tensor_model_parallel_size": 1}, None),
+        ({"name": "vllm", "tensor_model_parallel_size": 2, "enable": False}, None),
+        ({"name": "sglang", "tensor_model_parallel_size": 2}, None),
+    ],
+)
+def test_tensor_parallel_vllm_rollout_all_reduces_through_nccl_unless_configured(rollout, expected):
+    config = _minimal_tinker_config()
+    config.actor_rollout_ref.rollout = rollout
+
+    config = process_actor_rollout_ref_config(config)
+
+    assert OmegaConf.select(config, "actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce") is expected
+
+
 def test_tinker_config_keeps_distillation_but_not_other_unsupported_ppo_sections():
     config = _minimal_tinker_config()
     config.reward = {"reward_model": {"enable": True}}
