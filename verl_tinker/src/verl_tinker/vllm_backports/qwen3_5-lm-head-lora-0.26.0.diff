@@ -1,0 +1,16 @@
+# Backport of vLLM PR #48850 (commit 5a4c8d99242e, "[Bugfix][LoRA] Add embedding_modules for Qwen3.5 CausalLM"),
+# in vLLM since 0.27; rebased onto vLLM 0.26.0. Apache-2.0.
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -296,6 +296,11 @@
+         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+         "in_proj_ba": ["in_proj_b", "in_proj_a"],
+     }
++    # Maps PEFT embed/lm_head LoRA targets onto vLLM embedding wrappers.
++    embedding_modules = {
++        "embed_tokens": "input_embeddings",
++        "lm_head": "output_embeddings",
++    }
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         config = vllm_config.model_config.hf_text_config

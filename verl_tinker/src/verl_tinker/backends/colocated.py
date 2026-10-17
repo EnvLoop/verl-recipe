@@ -25,6 +25,7 @@ serialization lock for synchronous training and checkpoint operations.
 """
 
 import asyncio
+import math
 import logging
 import threading
 import time
@@ -214,6 +215,287 @@ def _patch_layered_lora_collection() -> None:
 
 
 _patch_layered_lora_collection()
+
+
+def lora_init_seed(model_config) -> Optional[int]:
+    """Tinker ``LoraConfig.seed`` (EnvLoop: ``actor_rollout_ref.model.lora.seed``), or None."""
+    lora = getattr(model_config, "lora", None) or {}
+    seed = lora.get("seed") if hasattr(lora, "get") else None
+    if seed is None or getattr(model_config, "lora_adapter_path", None) is not None:
+        return None
+    return int(seed)
+
+
+def _patch_lora_build() -> None:
+    """Build the LoRA adapter like the reference: per-slice q/k/v LoRAs and a seeded init.
+
+    * Split q/k/v (``lora_split``): every Gated DeltaNet ``in_proj_qkv`` is marked before
+      ``get_peft_model`` and VeRL's ``LoraConfig`` is swapped for one that routes it to the split
+      LoRA layer, so the fused projection trains three independent LoRAs (q, k, v) like the
+      reference. The base weight and its name are unchanged. Not for adapters loaded from
+      ``lora_adapter_path`` (PEFT rebuilds those from their own config);
+      ``actor_rollout_ref.model.lora.split_qkv: false`` keeps the fused LoRA (previous layout).
+    * Seed: VeRL creates the adapter with ``get_peft_model`` (``lora_A`` Kaiming uniform from the
+      global torch RNG, ``lora_B`` zero) before FSDP wrapping, and rank 0's initialised weights are
+      what FSDP broadcasts to every rank. Seeding the RNGs (CPU and the current accelerator) for
+      just that call gives the same adapter for the same seed (``LoraConfig.seed``); the global
+      RNG state is restored afterwards. Without a seed nothing changes.
+
+    Runs at import, like the patch above.
+    """
+    try:
+        from verl.workers.engine.fsdp import transformer_impl
+    except Exception:  # noqa: BLE001 - a VeRL without the FSDP engine has nothing to patch
+        return
+    from contextlib import ExitStack
+
+    from ..lora_split import lora_config_class, mark_split_qkv
+
+    FSDPEngine = transformer_impl.FSDPEngine
+    original = FSDPEngine._build_lora_module
+    if getattr(original, "_envloop_lora_patch", False):
+        return
+
+    def _build_lora_module(self, module):
+        import torch
+
+        with ExitStack() as stack:
+            lora = getattr(self.model_config, "lora", None) or {}
+            split = lora.get("split_qkv", True) if hasattr(lora, "get") else True
+            if split and getattr(self.model_config, "lora_adapter_path", None) is None and mark_split_qkv(module):
+                default_config = transformer_impl.LoraConfig
+                transformer_impl.LoraConfig = lora_config_class()
+                stack.callback(setattr, transformer_impl, "LoraConfig", default_config)
+            seed = lora_init_seed(self.model_config)
+            if seed is not None:
+                devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+                stack.enter_context(torch.random.fork_rng(devices=devices))
+                torch.manual_seed(seed)
+            return original(self, module)
+
+    _build_lora_module._envloop_lora_patch = True
+    _build_lora_module._envloop_seed_patch = True
+    FSDPEngine._build_lora_module = _build_lora_module
+
+    original_params = FSDPEngine.get_per_tensor_param
+    if getattr(original_params, "_envloop_lora_patch", False):
+        return
+
+    def get_per_tensor_param(self, *args, **kwargs):
+        """Adapter tensors for vLLM in PEFT file naming (``in_proj_{q,k,v}`` for the split LoRAs)."""
+        from ..lora_split import split_peft_name
+
+        params, peft_config = original_params(self, *args, **kwargs)
+        if peft_config is None:
+            return params, peft_config
+        return ((split_peft_name(name), tensor) for name, tensor in params), peft_config
+
+    get_per_tensor_param._envloop_lora_patch = True
+    FSDPEngine.get_per_tensor_param = get_per_tensor_param
+
+
+_patch_lora_build()
+
+
+def _assign_full_params(model, full: dict) -> int:
+    """Copy full tensors into a (FSDP1 or FSDP2) model's parameters by name; returns how many were set."""
+    import torch
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    def clean(name: str) -> str:
+        return name.replace("_fsdp_wrapped_module.", "").replace("_checkpoint_wrapped_module.", "")
+
+    assigned = 0
+    with torch.no_grad():
+        if any(isinstance(p, DTensor) for p in model.parameters()):  # FSDP2
+            for name, param in model.named_parameters():
+                tensor = full.get(clean(name))
+                if tensor is None:
+                    continue
+                local = distribute_tensor(
+                    tensor.to(param.device, param.dtype), param.device_mesh, param.placements, src_data_rank=None
+                ).to_local()
+                param.to_local().copy_(local)
+                assigned += 1
+            return assigned
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        prefixes = {id(module): name for name, module in model.named_modules()}
+        for unit in FSDP.fsdp_modules(model):  # each LoRA leaf is its own FSDP1 unit
+            with FSDP.summon_full_params(unit, recurse=False, writeback=True):
+                for name, param in unit.named_parameters():
+                    key = clean(f"{prefixes[id(unit)]}.{name}" if prefixes[id(unit)] else name)
+                    tensor = full.get(key)
+                    if tensor is not None and tuple(param.shape) == tuple(tensor.shape):
+                        param.copy_(tensor.to(param.device, param.dtype))
+                        assigned += 1
+    return assigned
+
+
+def _full_state_value(parts: list, shape) -> object:
+    """One optimizer-state entry from every rank: DTensor (FSDP2), flat local views (FSDP1) or a scalar."""
+    import torch
+
+    from ..lora_split import full_tensor
+
+    first = parts[0]
+    if not isinstance(first, torch.Tensor) or first.dim() == 0:
+        return first
+    if type(first).__name__ == "DTensor":
+        return full_tensor(parts)
+    if tuple(first.shape) == tuple(shape):  # unsharded (one rank)
+        return first
+    flat = torch.cat([part.reshape(-1) for part in parts])  # FSDP1 use_orig_params: 1-D local views in rank order
+    return flat[: math.prod(shape)].reshape(shape)
+
+
+def _local_state_value(value, param, world_size: int, rank: int):
+    """A full optimizer-state tensor -> this rank's piece, shaped like the live (sharded) parameter."""
+    import torch
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    if not isinstance(value, torch.Tensor) or value.dim() == 0:
+        return value
+    if isinstance(param, DTensor):  # FSDP2
+        return distribute_tensor(value.to(param.device), param.device_mesh, param.placements, src_data_rank=None)
+    flat = value.reshape(-1)  # FSDP1: every LoRA leaf is its own unit, padded to a multiple of world_size
+    chunk = -(-flat.numel() // world_size)
+    local = flat[rank * chunk : (rank + 1) * chunk]
+    if local.numel() != param.numel():
+        raise ValueError("unexpected FSDP1 shard layout for a LoRA parameter")
+    return local.reshape(param.shape).to(param.device)
+
+
+def _load_legacy_optimizer(manager, local_path: str, full_params: dict, names: dict, sizes) -> None:
+    """Restore a fused-q/k/v checkpoint's Adam state into the split layer (``lora_split``).
+
+    ``full_params``: the checkpoint's full LoRA tensors by name (in checkpoint order, the optimizer's order).
+    """
+    import os
+
+    import torch
+
+    from ..lora_split import _SPLIT_PARAM, convert_legacy_optimizer_state
+
+    world, rank = manager.world_size, manager.rank
+    saved = [
+        torch.load(os.path.join(local_path, f"optim_world_size_{world}_rank_{r}.pt"), weights_only=False,
+                   map_location="cpu")
+        for r in range(world)
+    ]
+    def clean(name: str) -> str:
+        return name.replace("_fsdp_wrapped_module.", "").replace("_checkpoint_wrapped_module.", "")
+
+    # VeRL's optimizer holds every parameter (frozen ones have no state), in named_parameters order.
+    # The legacy model had the same order with one fused A / B where the split layer has q, k, v.
+    live_names = [clean(n) for n, _ in manager.model.named_parameters()]
+    legacy_names = []
+    for name in live_names:
+        match = _SPLIT_PARAM.match(name)
+        if match is None:
+            legacy_names.append(name)
+        elif match["slice"] == "q":
+            legacy_names.append(f"{match['prefix']}in_proj_qkv.lora_{match['ab']}{match['adapter'] or ''}.weight")
+    order = [index for group in saved[0]["param_groups"] for index in group["params"]]
+    if len(order) != len(legacy_names):
+        raise ValueError("optimizer parameters do not line up with the checkpoint's parameters")
+    full_states = {}
+    for index, name in zip(order, legacy_names, strict=True):
+        states = [sd["state"].get(index) for sd in saved]
+        if not states[0]:
+            continue
+        if name not in full_params:
+            raise ValueError(f"optimizer state for {name} has no LoRA tensor in the checkpoint")
+        full_states[name] = {
+            field: _full_state_value([state[field] for state in states], full_params[name].shape)
+            for field in states[0]
+        }
+    converted = convert_legacy_optimizer_state(full_states, names, sizes)
+
+    name_of = {id(p): clean(n) for n, p in manager.model.named_parameters()}
+    current = manager.optimizer.state_dict()
+    params = [p for group in manager.optimizer.param_groups for p in group["params"]]
+    state = {}
+    for index, param in enumerate(params):
+        entry = converted.get(name_of.get(id(param)))
+        if entry:
+            state[index] = {k: _local_state_value(v, param, world, rank) for k, v in entry.items()}
+    manager.optimizer.load_state_dict({"state": state, "param_groups": current["param_groups"]})
+
+
+def _patch_legacy_lora_checkpoints() -> None:
+    """Resume checkpoints written before the split q/k/v LoRA (one fused ``in_proj_qkv`` LoRA).
+
+    Their adapter converts exactly (``lora_split``: ``A`` copied to q, k and v, ``B`` sliced): every
+    rank reads all ranks' model (and optimizer) shards (one node), converts the full tensors and
+    copies them into its own parameters. Adam state converts the same way: ``B``'s moments are
+    sliced, ``A``'s copied to q, k and v, ``step`` kept, so the next step updates ``B`` exactly as
+    the fused layout would (``A`` gets per-slice gradients from then on). Everything else (extra
+    state, RNG) loads as before. Checkpoints in the current layout take VeRL's own path.
+    """
+    try:
+        from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
+    except Exception:  # noqa: BLE001
+        return
+    original = FSDPCheckpointManager.load_checkpoint
+    if getattr(original, "_envloop_legacy_lora", False):
+        return
+
+    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        import os
+
+        import torch
+
+        from ..lora_split import SplitQKVLinear, convert_legacy_full, full_tensor, legacy_split_names
+
+        model_file = os.path.join(local_path or "", f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+        if local_path is None or not self.should_load_model or not os.path.isfile(model_file):
+            return original(self, local_path, hdfs_path, del_local_after_load)
+        own = torch.load(model_file, weights_only=False, map_location="cpu")
+        names = legacy_split_names(own)
+        split_layers = {
+            name.replace("_fsdp_wrapped_module.", "").removesuffix(".base_layer"): module.split_sizes
+            for name, module in self.model.named_modules()
+            if isinstance(module, SplitQKVLinear)
+        }
+        if not names or not split_layers:
+            return original(self, local_path, hdfs_path, del_local_after_load)
+        shards = [own] + [
+            torch.load(os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{rank}.pt"),
+                       weights_only=False, map_location="cpu")
+            for rank in range(self.world_size) if rank != self.rank
+        ]
+        shards.insert(self.rank, shards.pop(0))
+        full = {key: full_tensor([shard[key] for shard in shards]) for key in own}
+
+        def sizes(key: str):
+            prefix = key.split(".in_proj_qkv.")[0] + ".in_proj_qkv"
+            return split_layers[prefix]
+
+        converted = convert_legacy_full(full, names, sizes)
+        assigned = _assign_full_params(self.model, converted)
+        if assigned != len(converted):
+            raise RuntimeError(f"legacy LoRA checkpoint: set {assigned} of {len(converted)} adapter tensors")
+        restored = "not requested"
+        if self.should_load_optimizer:
+            _load_legacy_optimizer(self, local_path, full, names, sizes)
+            restored = "restored"
+        logger.warning(
+            "Loaded a fused-q/k/v LoRA checkpoint from %s as separate q/k/v LoRAs (%d tensors); optimizer state %s",
+            local_path, assigned, restored,
+        )
+        contents = self.checkpoint_load_contents
+        self.checkpoint_load_contents = [item for item in contents if item not in ("model", "optimizer")]
+        try:
+            return original(self, local_path, hdfs_path, del_local_after_load)
+        finally:
+            self.checkpoint_load_contents = contents
+
+    load_checkpoint._envloop_legacy_lora = True
+    FSDPCheckpointManager.load_checkpoint = load_checkpoint
+
+
+_patch_legacy_lora_checkpoints()
 
 
 class TinkerServerActorRolloutRefWorker(TinkerActorRolloutRefWorker):

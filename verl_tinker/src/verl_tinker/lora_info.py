@@ -24,6 +24,7 @@ training.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -47,6 +48,13 @@ _ATTN_MODULES = frozenset(
         "kv_b_proj",
         "in_proj",
         "out_proj",
+        # Qwen3.5 Gated DeltaNet (linear attention); Tinker counts it as attention.
+        "in_proj_qkv",
+        "in_proj_q",
+        "in_proj_k",
+        "in_proj_v",
+        "in_proj_z",
+        "in_proj_qkvz",
         "self_attn",
         "attn",
         "attention",
@@ -73,6 +81,26 @@ _MLP_MODULES = frozenset(
 )
 _UNEMBED_MODULES = frozenset({"lm_head", "embed_out", "output_layer"})
 
+# EnvLoop passes the module selection as a PEFT regex over leaf names
+# (EnvPlatform ``lora_targets.peft_regex``): ``(?:.*\.)?(?:down_proj|lm_head|...)``.
+_LEAF_REGEX = re.compile(r"\(\?:\.\*\\\.\)\?\(\?:(?P<leaves>\w+(?:\|\w+)*)\)")
+
+
+def leaf_modules(target_modules: Any) -> Any:
+    """``target_modules`` with an EnvLoop leaf regex expanded to the sorted modules that get a LoRA.
+
+    The fused Gated DeltaNet ``in_proj_qkv`` trains separate q/k/v LoRAs (``lora_split``), reported
+    as ``in_proj_q`` / ``in_proj_k`` / ``in_proj_v`` like the exported adapter.
+    """
+    if isinstance(target_modules, str):
+        match = _LEAF_REGEX.fullmatch(target_modules)
+        if match is not None:
+            leaves = set(match["leaves"].split("|"))
+            if "in_proj_qkv" in leaves:
+                leaves = (leaves - {"in_proj_qkv"}) | {"in_proj_q", "in_proj_k", "in_proj_v"}
+            return sorted(leaves)
+    return target_modules
+
 
 @dataclass(frozen=True)
 class LoraInfo:
@@ -87,6 +115,11 @@ class LoraInfo:
     def is_lora(self) -> bool:
         return self.rank > 0
 
+    @property
+    def explicit_targets(self) -> bool:
+        """``target_modules`` is a module list (EnvLoop derives it from Tinker's train_* flags)."""
+        return isinstance(self.target_modules, (list, tuple))
+
     def metadata(self) -> dict[str, Any]:
         """Tinker-shaped LoRA fields (``WeightsInfoResponse`` / training-run metadata)."""
         if not self.is_lora:
@@ -98,6 +131,7 @@ class LoraInfo:
             "train_unembed": self.train_unembed,
             "train_mlp": self.train_mlp,
             "train_attn": self.train_attn,
+            "target_modules": sorted(self.target_modules) if self.explicit_targets else self.target_modules,
         }
 
 
@@ -164,6 +198,7 @@ def configured_lora_info(config: Any) -> LoraInfo:
         rank = int(_get(model, "lora_rank", 0) or 0)
         alpha = _get(model, "lora_alpha")
         target_modules = _plain(_get(model, "target_modules", "all-linear"))
+    target_modules = leaf_modules(target_modules)
     if rank <= 0:
         return FULL_PARAMETER
     train_attn, train_mlp, train_unembed = train_flags_for_target_modules(target_modules)

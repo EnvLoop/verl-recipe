@@ -41,6 +41,7 @@ from tinker.types import (
 
 from .backends.colocated import ColocatedBackend, RolloutState
 from .backends.teacher import TeacherInferenceBackend
+from .capabilities import runtime_capabilities
 from .lora_info import LoraInfo, configured_lora_info
 from .model_resource_manager import (
     LazyRolloutPlan,
@@ -318,7 +319,7 @@ class TinkerServer:
         return {"base_model": req.base_model, **self._lora_info().metadata()}
 
     def _check_create_model_lora(self, req: TinkerCreateModelRequest) -> None:
-        """The adapter rank is fixed at server start; a different requested rank is a 409."""
+        """The adapter is fixed at server start; a different rank (or layer selection) is a 409."""
         optimizer_config = getattr(req, "optimizer_config", None)
         optimizer_type = (
             optimizer_config.get("type")
@@ -345,18 +346,30 @@ class TinkerServer:
                 f"LoRA rank {info.rank} (actor_rollout_ref.model.lora_rank); the adapter rank cannot change "
                 f"at runtime. Request rank={info.rank} or start a server with the desired rank.",
             )
-        for flag in ("train_attn", "train_mlp", "train_unembed"):
-            requested = getattr(lora_config, flag, None)
-            if requested is not None and bool(requested) != getattr(info, flag):
-                logger.warning(
-                    "create_model requested %s=%s but the server adapter (target_modules=%r) has %s=%s; "
-                    "training uses the server configuration",
-                    flag,
-                    requested,
-                    info.target_modules,
-                    flag,
-                    getattr(info, flag),
-                )
+        mismatched = {
+            flag: bool(getattr(lora_config, flag))
+            for flag in ("train_attn", "train_mlp", "train_unembed")
+            if getattr(lora_config, flag, None) is not None and bool(getattr(lora_config, flag)) != getattr(info, flag)
+        }
+        if mismatched and info.explicit_targets:
+            # The adapter was built from Tinker's flags (EnvLoop sets target_modules per
+            # create_model); a different layer selection would silently train other layers.
+            raise HTTPException(
+                HTTPStatus.CONFLICT,
+                f"create_model requested {mismatched}, but this server's LoRA adapter trains "
+                f"train_attn={info.train_attn}, train_mlp={info.train_mlp}, train_unembed={info.train_unembed} "
+                f"(target_modules={info.target_modules!r}); the adapter layers cannot change at runtime.",
+            )
+        for flag, requested in mismatched.items():
+            logger.warning(
+                "create_model requested %s=%s but the server adapter (target_modules=%r) has %s=%s; "
+                "training uses the server configuration",
+                flag,
+                requested,
+                info.target_modules,
+                flag,
+                getattr(info, flag),
+            )
 
     def _current_model_metadata(self, model_id: str) -> dict[str, Any]:
         metadata = self._model_metadata.get(model_id)
@@ -646,7 +659,10 @@ class TinkerServer:
 
     @app.api_route("/api/v1/get_server_capabilities", methods=["GET", "POST"])
     async def get_server_capabilities(self):
-        return get_supported_models(self._get_engine(), getattr(self, "_teacher_backend", None))
+        return {
+            **get_supported_models(self._get_engine(), getattr(self, "_teacher_backend", None)),
+            "capabilities": runtime_capabilities(),
+        }
 
     @app.post("/api/v1/client/config")
     async def client_config(self):
@@ -671,6 +687,7 @@ class TinkerServer:
             "model_data": {"arch": None, "model_name": model_name, "tokenizer_id": model_name},
             "model_id": req.model_id,
             "optimizer_config": {"type": "adamw"},
+            "capabilities": runtime_capabilities(),
             **lora,
             "model_name": model_name,
         }
