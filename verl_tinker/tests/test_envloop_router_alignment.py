@@ -167,6 +167,7 @@ async def test_create_model_rejects_rank_mismatch_with_409_and_records_real_lora
         "train_unembed": False,
         "train_mlp": True,
         "train_attn": True,
+        "target_modules": "all-linear",
     }
 
 

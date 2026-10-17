@@ -216,6 +216,51 @@ def _patch_layered_lora_collection() -> None:
 _patch_layered_lora_collection()
 
 
+def lora_init_seed(model_config) -> Optional[int]:
+    """Tinker ``LoraConfig.seed`` (EnvLoop: ``actor_rollout_ref.model.lora.seed``), or None."""
+    lora = getattr(model_config, "lora", None) or {}
+    seed = lora.get("seed") if hasattr(lora, "get") else None
+    if seed is None or getattr(model_config, "lora_adapter_path", None) is not None:
+        return None
+    return int(seed)
+
+
+def _patch_lora_init_seed() -> None:
+    """Make the LoRA adapter initialisation reproducible for a given seed.
+
+    VeRL's FSDP engine creates the adapter with ``get_peft_model`` (``lora_A`` Kaiming
+    uniform from the global torch RNG, ``lora_B`` zero) before FSDP wrapping, and rank 0's
+    initialised weights are what FSDP broadcasts to every rank. Seeding the RNGs
+    (CPU and the current accelerator) for just that call gives the same adapter for the
+    same seed, as Tinker's ``LoraConfig.seed`` promises; the global RNG state is restored
+    afterwards. Without a seed nothing changes. Runs at import, like the patch above.
+    """
+    try:
+        from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
+    except Exception:  # noqa: BLE001 - a VeRL without the FSDP engine has nothing to patch
+        return
+    original = FSDPEngine._build_lora_module
+    if getattr(original, "_envloop_seed_patch", False):
+        return
+
+    def _build_lora_module(self, module):
+        seed = lora_init_seed(self.model_config)
+        if seed is None:
+            return original(self, module)
+        import torch
+
+        devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(seed)
+            return original(self, module)
+
+    _build_lora_module._envloop_seed_patch = True
+    FSDPEngine._build_lora_module = _build_lora_module
+
+
+_patch_lora_init_seed()
+
+
 class TinkerServerActorRolloutRefWorker(TinkerActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to_actor(self, device, model=True, optimizer=True, grad=True):

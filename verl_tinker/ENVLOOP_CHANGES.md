@@ -181,8 +181,11 @@ called from `backends/_loss.py`) with token-sum reduction scaled by `dp_size`
   asserts LoRA metadata.
 * `create_model` requesting a rank different from the configured one → HTTP
   409 with a clear message (nothing registered). Differing `train_*` flags are
-  logged, not rejected (the SDK default `train_unembed=True` would otherwise
-  break every all-linear server). Full-parameter servers accept any rank.
+  a 409 too when the server was started with an explicit module selection
+  (EnvLoop derives it from Tinker's flags, see "Tinker LoraConfig layers"
+  below); with `all-linear` they are only logged (the SDK default
+  `train_unembed=True` would otherwise break every all-linear server).
+  Full-parameter servers accept any rank.
 
 ## Wire contract summary (head JSON, as forwarded by the EnvLoop gateway)
 
@@ -424,3 +427,92 @@ LoRA rank 32, one cross-entropy datum, then a long-prompt sample:
 | 27B, 4 GPUs, FSDP2, SP4, fused + patch | 256K | 114.6 GiB | 373 s | 262K prompt 28 s |
 
 The full table is in EnvPlatform `docs/training/design/context-length.md`.
+
+With `include_prompt_logprobs` and `topk_prompt_logprobs` both set, the scalar `prompt_logprobs` now come from
+`sample_prompt_logprobs` (the actor forward that also serves `compute_logprobs`), while the top-k rows still
+come from the sampler. Tinker serves both from one engine; on Qwen3.8-27B the TP-2 sampler differed from the
+actor by up to 0.118 nats on single prompt tokens (mean 0.005), so the two APIs disagreed.
+
+## Tinker LoraConfig layers, seed and lm_head LoRA
+
+Tinker's `LoraConfig(rank, seed, train_attn, train_mlp, train_unembed)` now has real effect
+end to end (EnvPlatform: `lora_targets.py`, guest overlay; this repo: the pieces below).
+
+* **Layer selection.** EnvLoop passes the selected PEFT modules as
+  `actor_rollout_ref.model.target_modules` = a leaf-name regex
+  (`(?:.*\.)?(?:down_proj|gate_proj|lm_head|...)`, PEFT full-matches a string against every
+  module path). A string, not a list: the guest resolves its config in place
+  (`OmegaConf.resolve`), where an interpolation cannot become a list; the same string also
+  works with recipes older than this change. For Qwen3.5 (Qwen3.5-4B, Qwen3.8-27B):
+  attn = `q/k/v/o_proj` (full attention) + `in_proj_qkv`, `in_proj_z`, `out_proj` (Gated
+  DeltaNet; `in_proj_a/b` are not adapted, as on Tinker); mlp = `gate/up/down_proj`;
+  unembed = `lm_head`. The vision tower (`qkv`, `proj`, `linear_fc1/2`) is never adapted
+  (PEFT `all-linear` adapted it on these vision-language checkpoints). `lora_info` expands
+  the regex back to the module list (`leaf_modules`), derives `train_*` from it (GDN names
+  count as attention) and reports `target_modules` in `get_info` / model metadata.
+  `create_model` with other `train_*` flags than the server's explicit selection is a 409.
+* **Parameter count.** mlp and unembed equal Tinker's published per-rank counts
+  (`tinker_cookbook.hyperparam_utils`) exactly. Tinker trains separate LoRAs for the GDN
+  query/key/value (`in_proj_q/k/v`, each with its own A) where HF/vLLM have one fused
+  `in_proj_qkv`; adapting the fused Linear shares one A, so attn has `2 * hidden * rank`
+  fewer parameters per GDN layer (Qwen3.5-4B attn 774,144 vs 897,024 per rank, total
+  -5.4%; Qwen3.8-27B 2,473,984 vs 2,965,504, total -6.5%). `tests/test_envloop_lora_config.py`
+  checks the counts on the real architectures (meta device).
+* **Seed.** `actor_rollout_ref.model.lora.seed` (EnvLoop: `TINKER_LORA_SEED`) seeds the
+  RNGs around VeRL's `FSDPEngine._build_lora_module` (patched at import in
+  `backends/colocated.py`, like the IPC patch); rank 0's initialised adapter is what FSDP
+  broadcasts, so the same seed gives the same initial adapter. The global RNG state is
+  restored; an adapter loaded from `lora_adapter_path` and an unseeded config are unchanged.
+* **lm_head LoRA in the rollout.** vLLM only wraps a model's output layer with
+  `LogitsProcessorWithLoRA` when the model class lists `lm_head` in `embedding_modules`.
+  vLLM 0.26 (this lock) does not for Qwen3.5, and VeRL's in-memory adapter sync
+  (`TensorLoRARequest` -> `from_lora_tensors`) does not check expected modules, so the
+  rollout **silently dropped** the lm_head LoRA: the sampler sampled from other weights than
+  the actor trained. `vllm_plugin.py` (entry point `vllm.general_plugins`, loaded in every
+  vLLM process) backports vLLM 0.31's `Qwen3_5ForCausalLMBase.embedding_modules`; a vLLM that
+  already declares `lm_head` is left alone.
+* Non-power-of-two ranks work in the backend (vLLM zero-pads the adapter into
+  `max_lora_rank`, the next value of `MaxLoRARanks`); EnvLoop still only accepts Tinker's
+  powers of two.
+
+GPU validation (2026-10-17, 2x H100 80GB SXM, Vast, driver 615.71, vLLM 0.26.0 / peft 0.18.1 /
+transformers 5.9.0 from `uv.lock`, installed with `install_verl.sh`; server started like an
+EnvLoop guest: EnvPlatform `trainingmaster-actor-rollout.yaml` + `recipe_server.py` + the
+`TINKER_*` env EnvPlatform's `plan_model` renders; `tests/gpu/test_envloop_lora_gpu.py`):
+
+| model / GPUs | adapter (rank, layers) | exported adapter params (= rank x expected) | sampler vs actor after 8 steps, mean abs dlogprob | peak GPU MiB |
+|---|---|---|---|---|
+| Qwen3.5-4B, 1x H100, FSDP2, TP1 / 0.4 | 32, all (seed 5) | 68,976,640 = 32 x 2,155,520 | 0.0006 (before training 0.022) | 47,847 |
+| | 16, attn only | 12,386,304 = 16 x 774,144 | 0.0042 | 43,513 |
+| | 24, mlp only (rank padded to vLLM 32) | 27,131,904 = 24 x 1,130,496 | 0.0015 | 34,309 |
+| | 8, unembed only | 2,007,040 = 8 x 250,880 | 0.0028 | 34,313 |
+| | 8, unembed only, **plugin disabled** | same | **1.98** (0% trained tokens sampled: lm_head LoRA dropped) | 42,273 |
+| | 128, all | 275,906,560 = 128 x 2,155,520 | 0.030 | 42,823 |
+| | 256, all (not offered: Tinker max 128) | 551,813,120 | 0.067 (training diverged at lr 1e-3) | 44,309 |
+| Qwen3.8-27B, 2x H200, FSDP1, TP2 / 0.5, layered sync | 8, unembed only | 2,027,520 = 8 x 253,440 | 0.0024 (100% trained tokens) | n/a |
+| | 128, all (seed 5) | 902,758,400 = 128 x 7,052,800 | 0.0126 | 101,595 / GPU |
+| Qwen3.8-27B, 2x H100 80GB, same, **on this branch rebased on `_layered_lora_params`** | 128, all (seed 5) | 902,758,400 | 0.025 (before training 0.027) | 75,999 / GPU |
+
+* Every exported adapter has exactly the expected `target_modules`, `r`, `lora_alpha: 32` and no
+  vision-tower tensors; `get_info` reports them and `create_model` with other flags is a 409.
+* Seed: the initial adapter digest for seed 5 is identical across server runs and machines
+  (4B: three runs on H100 and H200; 27B: H100 and H200).
+* A 4,000-token `forward_backward` + `optim_step` runs at every rank (4B ~1 s, 27B 4.4 s at rank 128).
+* Qwen3.8-27B: with the default full-model weight sync (`layered_summon: false`,
+  `load_format: dummy`) the first `save_weights_for_sampler` OOMs on 2x H100 **and** 2x H200 (FSDP1
+  `summon_full_params` of the whole model while the sleeping vLLM worker keeps ~30 GiB; reproduced
+  with the legacy `all-linear` adapter and without the plugin, and in the EnvLoop prod e2e). This is
+  what "LoRA rollout sync gathers one FSDP unit at a time" above fixes (EnvPlatform's 27B profile
+  sets `layered_summon: true` + `load_format: safetensors`). The 27B rows above ran with those two
+  settings; the H200 rows on VeRL's own collector (before `_layered_lora_params`, i.e. its
+  host-memory fallback), the H100 row on `_layered_lora_params`.
+
+Known limitation outside this repo: vLLM 0.31 (EnvLoop's serving engine) loads a Qwen3.5 `lm_head`
+LoRA from a PEFT adapter but does not apply it (offline `LLM`, V1 and V2 model runners: an
+unembed-only adapter scores exactly like the base model, while HF transformers + PEFT reproduce the
+actor within 0.03). Serving endpoints keep rejecting `lm_head` adapters.
+
+Files: new `src/verl_tinker/vllm_plugin.py`, `tests/test_envloop_lora_config.py`,
+`tests/gpu/test_envloop_lora_gpu.py`; changed `src/verl_tinker/lora_info.py`,
+`src/verl_tinker/tinker_router.py`, `src/verl_tinker/backends/colocated.py`, `pyproject.toml`
+(entry point only; `uv.lock` unchanged), `tests/test_envloop_router_alignment.py`.
