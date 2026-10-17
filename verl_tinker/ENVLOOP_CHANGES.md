@@ -451,13 +451,33 @@ end to end (EnvPlatform: `lora_targets.py`, guest overlay; this repo: the pieces
   the regex back to the module list (`leaf_modules`), derives `train_*` from it (GDN names
   count as attention) and reports `target_modules` in `get_info` / model metadata.
   `create_model` with other `train_*` flags than the server's explicit selection is a 409.
-* **Parameter count.** mlp and unembed equal Tinker's published per-rank counts
-  (`tinker_cookbook.hyperparam_utils`) exactly. Tinker trains separate LoRAs for the GDN
-  query/key/value (`in_proj_q/k/v`, each with its own A) where HF/vLLM have one fused
-  `in_proj_qkv`; adapting the fused Linear shares one A, so attn has `2 * hidden * rank`
-  fewer parameters per GDN layer (Qwen3.5-4B attn 774,144 vs 897,024 per rank, total
-  -5.4%; Qwen3.8-27B 2,473,984 vs 2,965,504, total -6.5%). `tests/test_envloop_lora_config.py`
-  checks the counts on the real architectures (meta device).
+* **Separate q/k/v LoRAs on the Gated DeltaNet `in_proj_qkv` (`lora_split.py`).** The
+  reference trains separate LoRAs on the query, key and value slices of each GDN layer's fused
+  projection (`in_proj_q/k/v`, each rank r with its own A; tinker-cookbook
+  `weights/_merge_qwen3_5.SPLIT_QKV_SUFFIXES`). The HF model keeps one `in_proj_qkv` Linear, so
+  before `get_peft_model` it is re-classed to the marker `SplitQKVLinear` (same parameter and
+  name: HF loading, FSDP, the rollout base sync and VeRL's SP patch are unaffected) and a PEFT
+  custom LoRA layer (`LoraConfig._register_custom_module`, PEFT's extension point) holds three A
+  and three B: `in_proj_qkv(x) = W x + alpha/r * cat(B_q A_q x, B_k A_k x, B_v A_v x)`. The
+  per-rank parameter counts now equal the reference's exactly (Qwen3.5-4B 2,278,400, Qwen3.8-27B
+  7,544,320 for all layers; tests on the real architectures). Names: FSDP / checkpoints
+  `…in_proj_qkv.lora_A.default.{q,k,v}.weight`; vLLM and exported adapters
+  `…in_proj_{q,k,v}.lora_A.weight` (the engine's `get_per_tensor_param` is renamed accordingly).
+  `actor_rollout_ref.model.lora.split_qkv: false` keeps the previous fused LoRA.
+  Searched first: SkyRL tx has a single fused LoRA here; PEFT has no per-slice LoRA on a fused
+  layer (`target_parameters` is for MoE expert parameters); the cookbook only merges q/k/v into a
+  rank-3r PEFT adapter, which vLLM cannot serve without 3x `max_lora_rank`.
+* **Serving the split LoRAs (`vllm_split_qkv.py`, `vllm.general_plugins` entry point).** vLLM's
+  LoRA layer for `in_proj_qkvz` already has four slices [q, k, v, z], each with its own rank-r A/B
+  buffers, but knows only `in_proj_qkv` / `in_proj_z` by name. The plugin sets
+  `in_proj_qkvz: [in_proj_q, in_proj_k, in_proj_v, in_proj_z, in_proj_qkv]` on the Qwen3.5
+  classes and, around `LoRAModelManager._create_merged_loras_inplace`, converts a legacy fused
+  `in_proj_qkv` LoRA exactly (A copied, B sliced) and keeps the four slice entries. Works on vLLM
+  0.26 (rollout) and 0.31 (the sampling pool must load it too).
+* **Old checkpoints.** A checkpoint with fused `in_proj_qkv` LoRAs loads into the split layer
+  exactly (`FSDPCheckpointManager.load_checkpoint` patch: every rank reads all ranks' shards,
+  converts the full tensors and copies them into its FSDP1 / FSDP2 parameters). Its optimizer
+  state (another parameter layout) is not restored; the next step is a first Adam step.
 * **Seed.** `actor_rollout_ref.model.lora.seed` (EnvLoop: `TINKER_LORA_SEED`) seeds the
   RNGs around VeRL's `FSDPEngine._build_lora_module` (patched at import in
   `backends/colocated.py`, like the IPC patch); rank 0's initialised adapter is what FSDP
@@ -531,12 +551,25 @@ identical (0.0), adapters 0.047 / 0.033 mean (0.14 max), the same as batching on
 itself (0.026 mean, 0.17 max), i.e. bf16 batch noise, no cross-adapter leak (unpatched vLLM leaks
 up to 15 nats). Prompt logprobs of either adapter alone vs the actor: 0.046 / 0.048 mean.
 
+Split q/k/v LoRAs (2026-10-17, 1x H100, Qwen3.5-4B, fused log-prob kernels on):
+
+| check | result |
+|---|---|
+| exported adapter, rank 32, all layers, seed 5 | 72,908,800 parameters = 32 x 2,278,400 (the reference count), `target_modules` with `in_proj_q/k/v` |
+| sampler vs actor after training (vLLM 0.26 + plugin) | 0.0011 mean |
+| rollout prompt logprobs vs actor | 0.031 mean |
+| fused-q/k/v checkpoint (written with `split_qkv: false`) resumed by a split server | actor logprobs identical (max diff 0.00000); sampler vs actor 0.012 |
+| legacy fused adapter (HF PEFT, rank 8) on vLLM 0.26 + plugin vs HF + PEFT | 0.022 mean (adapter effect 0.665) |
+| same on vLLM 0.31 + plugin + #62049 (the sampling pool's engine) | 0.029 mean |
+| split adapter from training on vLLM 0.31 + plugin + #62049 vs actor | 0.035 mean prompt logprobs, greedy completion 9/10 tokens identical |
+
 Correction: an earlier draft said vLLM 0.31 ignores a Qwen3.5 `lm_head` LoRA. It applies it when
 generating; what differed was prompt logprobs, i.e. the #62049 bug above (found by the EnvLoop
 sampling-pool work). The pool applies the same backport; serving endpoints keep rejecting `lm_head`
 adapters until it lands there too.
 
-Files: new `src/verl_tinker/vllm_backports/` (applier + two diffs), `tests/test_envloop_lora_config.py`,
+Files: new `src/verl_tinker/vllm_backports/` (applier + two diffs), `src/verl_tinker/lora_split.py`,
+`src/verl_tinker/vllm_split_qkv.py`, `src/verl_tinker/capabilities.py`, `tests/test_envloop_lora_config.py`,
 `tests/gpu/test_envloop_lora_gpu.py`; changed `src/verl_tinker/lora_info.py`,
 `src/verl_tinker/tinker_router.py`, `src/verl_tinker/backends/colocated.py`, `src/verl_tinker/start.py`,
-`pyproject.toml` (package data only; `uv.lock` unchanged), `tests/test_envloop_router_alignment.py`.
+`pyproject.toml` (package data + one `vllm.general_plugins` entry point; `uv.lock` unchanged), `tests/test_envloop_router_alignment.py`.
