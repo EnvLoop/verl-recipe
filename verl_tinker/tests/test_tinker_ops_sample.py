@@ -217,7 +217,8 @@ async def test_sample_formats_topk_prompt_logprobs_for_current_tinker_schema():
 
 
 @pytest.mark.asyncio
-async def test_sample_returns_scalar_and_topk_prompt_logprobs_together():
+async def test_sample_returns_scalar_and_topk_prompt_logprobs_together(monkeypatch):
+    """Both fields come back; the scalar ones match compute_logprobs (actor forward)."""
     req = SimpleNamespace(
         prompt=_Prompt(),
         sampling_params=SimpleNamespace(max_tokens=4, temperature=0.7, top_p=0.9, top_k=20, stop=None, seed=None),
@@ -225,23 +226,20 @@ async def test_sample_returns_scalar_and_topk_prompt_logprobs_together():
         prompt_logprobs=True,
         topk_prompt_logprobs=2,
     )
+    scored = []
 
-    class RecordingEngine(_Engine):
-        def __init__(self):
-            super().__init__()
-            self.calls = []
+    async def actor_prompt_logprobs(engine, request, *, reference):
+        scored.append((request, reference))
+        return {"prompt_logprobs": [None, -1.0, -2.0]}
 
-        async def generate(self, request_id, prompt_ids, sampling_params):
-            self.calls.append(dict(sampling_params))
-            return await super().generate(request_id, prompt_ids, sampling_params)
-
-    engine = RecordingEngine()
+    monkeypatch.setattr("verl_tinker.tinker_ops.sample_prompt_logprobs", actor_prompt_logprobs)
+    engine = _Engine()
     result = await sample(engine, req)
 
     assert result["topk_prompt_logprobs"] == [[], [(11, -1.1), (12, -2.2)], [(13, -3.3)]]
-    assert result["prompt_logprobs"] == [None, -1.1, -3.3]
-    assert [call["prompt_logprobs"] for call in engine.calls] == [2, 0]
-    assert engine.calls[1]["max_tokens"] == 1
+    assert result["prompt_logprobs"] == [None, -1.0, -2.0]
+    assert scored == [(req, False)]
+    assert engine.sampling_params["prompt_logprobs"] == 2  # the rollout pass still serves the top-k rows
 
 
 @pytest.mark.asyncio

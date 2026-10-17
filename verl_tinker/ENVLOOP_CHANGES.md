@@ -273,3 +273,10 @@ killing the session at the first `save_weights_for_sampler` (EnvLoop prod e2e, Q
 FSDP1, TP 2: the ~2.5 GB embedding exceeds the bucket; Qwen3.5-4B never takes this path). The backend
 module now patches `BucketedWeightSender._direct_send_large_weight` at import (in every Ray worker that
 loads the worker classes) to copy host tensors to the sender's device first.
+
+## Combined prompt logprobs are scored on the actor (same as compute_logprobs)
+
+With `include_prompt_logprobs` and `topk_prompt_logprobs` both set, the scalar `prompt_logprobs` now come from
+`sample_prompt_logprobs` (the actor forward that also serves `compute_logprobs`), while the top-k rows still
+come from the sampler. Tinker serves both from one engine; on Qwen3.8-27B the TP-2 sampler differed from the
+actor by up to 0.118 nats on single prompt tokens (mean 0.005), so the two APIs disagreed.
