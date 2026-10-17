@@ -113,6 +113,89 @@ def _patch_large_weight_ipc_device() -> None:
 _patch_large_weight_ipc_device()
 
 
+def _clean_fsdp_name(name: str) -> str:
+    return name.replace("_fsdp_wrapped_module.", "").replace("._fsdp_wrapped_module", "")
+
+
+def _layered_lora_params(fsdp_module):
+    """Collect the LoRA adapter one FSDP unit at a time; every adapter tensor or an error.
+
+    Replaces VeRL's ``layered_summon_lora_params``, which tests the *unit-relative*
+    parameter names for ``lora_``. VeRL's LoRA wrap policy wraps each trainable LoRA
+    leaf (``...q_proj.lora_A.default``) as its own FSDP unit, whose only parameter is
+    ``weight``, so that collector finds nothing and VeRL falls back to summoning the
+    whole model (Qwen3.8-27B: ~54 GB per GPU, an OOM on 80 GB cards next to vLLM).
+    Here the test uses the full name, only units that own LoRA tensors are gathered
+    (a few MB each), and the result must contain every adapter tensor of the model.
+    """
+    from collections import OrderedDict
+    from contextlib import nullcontext
+
+    from peft.utils.save_and_load import get_peft_model_state_dict
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    from verl.utils.device import get_torch_device
+    from verl.utils.fsdp_utils import fsdp_version
+
+    peft_model = getattr(fsdp_module, "_fsdp_wrapped_module", fsdp_module)
+    expected = set(get_peft_model_state_dict(peft_model, state_dict={
+        _clean_fsdp_name(name): param for name, param in fsdp_module.named_parameters()
+        if "lora_" in _clean_fsdp_name(name)
+    }))
+    lora_params = OrderedDict()
+    for name, submodule in fsdp_module.named_modules():
+        if name == "" or fsdp_version(submodule) == 0:
+            continue
+        prefix = _clean_fsdp_name(name)
+        # FSDP1 strips wrapper prefixes from parameter names only inside summon_full_params.
+        nested = {_clean_fsdp_name(n) for n, m in submodule.named_modules() if n != "" and fsdp_version(m) > 0}
+
+        def own(unit=submodule, nested=nested, prefix=prefix):
+            for n, param in unit.named_parameters():
+                n = _clean_fsdp_name(n)
+                if any(n.startswith(f"{child}.") for child in nested):
+                    continue
+                full = f"{prefix}.{n}"
+                if "lora_" in full:
+                    yield full, param
+
+        if next(own(), None) is None:
+            continue
+        is_fsdp1 = fsdp_version(submodule) == 1
+        if is_fsdp1:
+            submodule._is_root = True  # as VeRL's collector: lets an inner unit summon on its own
+        try:
+            with FSDP.summon_full_params(submodule, writeback=False) if is_fsdp1 else nullcontext():
+                for key, param in get_peft_model_state_dict(peft_model, state_dict=dict(own())).items():
+                    full = param.full_tensor() if hasattr(param, "full_tensor") else param
+                    lora_params[key] = full.detach().cpu()
+        finally:
+            if is_fsdp1:
+                submodule._is_root = False
+        get_torch_device().empty_cache()
+    missing = expected - set(lora_params)
+    if missing or not lora_params:
+        raise RuntimeError(f"layered LoRA collection missed {len(missing)} of {len(expected)} adapter tensors, "
+                           f"e.g. {sorted(missing)[:3]}")
+    return lora_params
+
+
+def _patch_layered_lora_collection() -> None:
+    """Install ``_layered_lora_params`` for ``collect_lora_params(layered_summon=True)``."""
+    try:
+        from verl.utils import fsdp_utils
+    except Exception:  # noqa: BLE001 - nothing to patch without VeRL's FSDP utilities
+        return
+    if getattr(fsdp_utils.layered_summon_lora_params, "_envloop_layered_patch", False):
+        return
+    _layered_lora_params._envloop_layered_patch = True
+    _layered_lora_params.upstream = fsdp_utils.layered_summon_lora_params
+    fsdp_utils.layered_summon_lora_params = _layered_lora_params
+
+
+_patch_layered_lora_collection()
+
+
 class TinkerServerActorRolloutRefWorker(TinkerActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to_actor(self, device, model=True, optimizer=True, grad=True):

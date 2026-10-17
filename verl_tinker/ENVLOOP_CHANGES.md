@@ -274,9 +274,25 @@ FSDP1, TP 2: the ~2.5 GB embedding exceeds the bucket; Qwen3.5-4B never takes th
 module now patches `BucketedWeightSender._direct_send_large_weight` at import (in every Ray worker that
 loads the worker classes) to copy host tensors to the sender's device first.
 
-## Combined prompt logprobs are scored on the actor (same as compute_logprobs)
+## LoRA rollout sync gathers one FSDP unit at a time (Qwen3.8-27B on 80 GB cards)
 
-With `include_prompt_logprobs` and `topk_prompt_logprobs` both set, the scalar `prompt_logprobs` now come from
-`sample_prompt_logprobs` (the actor forward that also serves `compute_logprobs`), while the top-k rows still
-come from the sampler. Tinker serves both from one engine; on Qwen3.8-27B the TP-2 sampler differed from the
-actor by up to 0.118 nats on single prompt tokens (mean 0.005), so the two APIs disagreed.
+`collect_lora_params(layered_summon=False)` summons the whole FSDP1 model to read the adapter: ~54 GB
+per GPU for Qwen3.8-27B on top of the awake vLLM weights, an OOM at the first `save_weights_for_sampler`
+on 2× H100 80 GB (EnvLoop prod e2e 2026-10-17; it only fit on B200). VeRL's `layered_summon_lora_params`
+would gather per unit, but it tests the *unit-relative* parameter names for `lora_`, and VeRL's LoRA wrap
+policy wraps every trainable LoRA leaf (`...q_proj.lora_A.default`) as its own FSDP unit whose only
+parameter is `weight`, so it returns nothing and VeRL falls back to a full summon (to host memory).
+The backend module replaces it at import with `_layered_lora_params`: it tests full names, gathers only
+units that own adapter tensors, and raises unless it returns every adapter tensor of the model
+(`tests/test_layered_lora_collection.py` runs both collectors on VeRL's wrapping of a tiny Llama).
+Layered summon needs vLLM to load the base weights itself (`rollout.load_format: safetensors`); EnvLoop
+sets both for its Qwen3.8-27B profile.
+
+## Combined prompt logprobs stay on the sampler (reverts fa571c9)
+
+fa571c9 scored the scalar `prompt_logprobs` of a request that also asks for `topk_prompt_logprobs` on the
+actor, on the belief that `compute_logprobs` runs there. It does not when the rollout holds the sampler's
+weights (`ModelResourceManager.resolve_resource` returns `ROLLOUT`), so the two APIs came from different
+engines: EnvLoop prod e2e Qwen3.5-4B max abs diff 0.084 (was exactly 0.0 with the sampler pass), and the
+recipe GPU suite failed on A100. The scalar pass is back on the sampler. The 0.118 gap first seen on
+Qwen3.8-27B (2× B200, TP 2) is between two sampler passes and is tracked separately.
