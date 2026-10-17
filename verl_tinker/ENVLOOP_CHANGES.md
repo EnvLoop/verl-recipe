@@ -285,10 +285,12 @@ parameter is `weight`, so it returns nothing and VeRL falls back to a full summo
 The backend module replaces it at import with `_layered_lora_params`: it tests full names, gathers only
 units that own adapter tensors, and raises unless it returns every adapter tensor of the model
 (`tests/test_layered_lora_collection.py` runs both collectors on VeRL's wrapping of a tiny Llama).
-Layered summon needs vLLM to load the base weights itself (`rollout.load_format: safetensors`). For
-Qwen3.8-27B in the colocated engine that fails: vLLM's CUDA-graph memory profiling hits "an illegal memory
-access" after loading the weights (EnvLoop prod 2026-10-17, two hosts; dummy weights start fine). EnvLoop
-therefore keeps 27B on dummy weights + full-summon sync and schedules it on 141 GB cards, where that fits.
+Layered summon needs vLLM to load the base weights itself (`rollout.load_format: safetensors`). EnvLoop
+first blamed safetensors for a Qwen3.8-27B rollout that failed CUDA-graph profiling with "an illegal memory
+access". Later runs reproduced the same crash with dummy weights, and the trigger turned out to be hosts on
+NVIDIA R595 drivers (595.71 / 595.91), with vLLM TP 2 (EnvLoop prod 2026-10-17). Per-unit sync with
+safetensors is therefore untested on other hosts, not disproven. EnvLoop currently runs 27B with dummy weights and
+the full-summon sync on B200, and moves it to FSDP2.
 
 ## Combined prompt logprobs stay on the sampler (reverts fa571c9)
 
