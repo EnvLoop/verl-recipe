@@ -394,10 +394,11 @@ def test_backend_reports_spare_slots_from_vllm_engine_kwargs(monkeypatch):
     # lm_head adapters follow the recipe's reported capability, not the session's target modules.
     unembed = _backend(engine_kwargs={"vllm": {"max_loras": 3}})
     unembed.config.actor_rollout_ref.model.target_modules = "(?:.*\\.)?(?:q_proj|lm_head)"
-    assert unembed.sampler_unembed_enabled is False  # this recipe has no verl_tinker.capabilities
     import sys
     import types
 
+    monkeypatch.setitem(sys.modules, "verl_tinker.capabilities", types.ModuleType("verl_tinker.capabilities"))
+    assert unembed.sampler_unembed_enabled is False  # a recipe without the capability report
     module = types.ModuleType("verl_tinker.capabilities")
     module.runtime_capabilities = lambda: {"lm_head_lora_prompt_logprobs": True}
     monkeypatch.setitem(sys.modules, "verl_tinker.capabilities", module)
