@@ -50,6 +50,9 @@ _ATTN_MODULES = frozenset(
         "out_proj",
         # Qwen3.5 Gated DeltaNet (linear attention); Tinker counts it as attention.
         "in_proj_qkv",
+        "in_proj_q",
+        "in_proj_k",
+        "in_proj_v",
         "in_proj_z",
         "in_proj_qkvz",
         "self_attn",
@@ -84,11 +87,18 @@ _LEAF_REGEX = re.compile(r"\(\?:\.\*\\\.\)\?\(\?:(?P<leaves>\w+(?:\|\w+)*)\)")
 
 
 def leaf_modules(target_modules: Any) -> Any:
-    """``target_modules`` with an EnvLoop leaf regex expanded to its sorted module list."""
+    """``target_modules`` with an EnvLoop leaf regex expanded to the sorted modules that get a LoRA.
+
+    The fused Gated DeltaNet ``in_proj_qkv`` trains separate q/k/v LoRAs (``lora_split``), reported
+    as ``in_proj_q`` / ``in_proj_k`` / ``in_proj_v`` like the exported adapter.
+    """
     if isinstance(target_modules, str):
         match = _LEAF_REGEX.fullmatch(target_modules)
         if match is not None:
-            return sorted(match["leaves"].split("|"))
+            leaves = set(match["leaves"].split("|"))
+            if "in_proj_qkv" in leaves:
+                leaves = (leaves - {"in_proj_qkv"}) | {"in_proj_q", "in_proj_k", "in_proj_v"}
+            return sorted(leaves)
     return target_modules
 
 

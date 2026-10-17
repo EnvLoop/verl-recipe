@@ -26,6 +26,7 @@ from test_envloop_router_alignment import _server
 from verl_tinker import capabilities, vllm_backports
 from verl_tinker.backends.colocated import lora_init_seed
 from verl_tinker.lora_info import configured_lora_info
+from verl_tinker.lora_split import lora_config_class, mark_split_qkv, split_legacy_tensors, split_peft_name
 
 # EnvLoop's PEFT modules for Qwen3.5 per Tinker layer family (EnvPlatform lora_targets.py).
 ATTN = ["in_proj_qkv", "in_proj_z", "k_proj", "o_proj", "out_proj", "q_proj", "v_proj"]
@@ -67,21 +68,20 @@ def _lora_param_count(model_name, target_modules, rank=1):
     config = config_cls(**TEXT_CONFIGS[model_name])
     with torch.device("meta"):
         model = transformers.Qwen3_5ForCausalLM(config)
-    model = peft.get_peft_model(model, peft.LoraConfig(r=rank, lora_alpha=32, target_modules=target_modules))
+    mark_split_qkv(model)
+    model = peft.get_peft_model(model, lora_config_class()(r=rank, lora_alpha=32, target_modules=target_modules))
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 @pytest.mark.parametrize("model_name", sorted(TINKER_PER_RANK))
 def test_target_modules_reproduce_tinker_lora_param_counts(model_name):
     tinker = TINKER_PER_RANK[model_name]
-    config = TEXT_CONFIGS[model_name]
     assert _lora_param_count(model_name, MLP) == tinker["mlp"]
     assert _lora_param_count(model_name, UNEMBED) == tinker["unembed"]
     assert _lora_param_count(model_name, MLP, rank=24) == 24 * tinker["mlp"]
-    # Tinker trains separate in_proj_q/k/v LoRAs on the Gated DeltaNet layers; the HF model's
-    # fused in_proj_qkv shares one A, i.e. 2 * hidden_size fewer parameters per rank and GDN layer.
-    gdn_layers = config["layer_types"].count("linear_attention")
-    assert _lora_param_count(model_name, ATTN) == tinker["attn"] - 2 * config["hidden_size"] * gdn_layers
+    # The Gated DeltaNet in_proj_qkv carries separate q/k/v LoRAs (lora_split), like the reference.
+    assert _lora_param_count(model_name, ATTN) == tinker["attn"]
+    assert _lora_param_count(model_name, ATTN + MLP + UNEMBED, rank=8) == 8 * sum(tinker.values())
 
 
 def _flags(target_modules):
@@ -272,3 +272,105 @@ def test_capability_reports_only_verified_backports(tmp_path, monkeypatch):
     assert capabilities.runtime_capabilities() == {"lm_head_lora_prompt_logprobs": True}
     assert vllm_backports.present(root, "9.9.9")  # a release without diffs ships the fixes
     capabilities.runtime_capabilities.cache_clear()
+
+
+class _GDN(torch.nn.Module):
+    """The shape of a Gated DeltaNet block as far as LoRA is concerned."""
+
+    def __init__(self, hidden=8, key_dim=4, value_dim=6):
+        super().__init__()
+        self.key_dim, self.value_dim = key_dim, value_dim
+        self.in_proj_qkv = torch.nn.Linear(hidden, 2 * key_dim + value_dim, bias=False)
+        self.out_proj = torch.nn.Linear(value_dim, hidden, bias=False)
+
+    def forward(self, x):
+        return self.in_proj_qkv(x)
+
+
+class _Block(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear_attn = _GDN()
+
+    def forward(self, x):
+        return self.linear_attn(x)
+
+
+def _split_model(rank=2, alpha=32):
+    peft = pytest.importorskip("peft")
+    torch.manual_seed(0)
+    model = _Block()
+    assert mark_split_qkv(model) == 1
+    model = peft.get_peft_model(model, lora_config_class()(r=rank, lora_alpha=alpha, target_modules=["in_proj_qkv"]))
+    layer = model.base_model.model.linear_attn.in_proj_qkv
+    for param in layer.lora_B["default"].parameters():  # B starts at zero; make the delta visible
+        torch.nn.init.normal_(param)
+    return model, layer
+
+
+def test_split_qkv_lora_is_three_independent_loras_on_the_fused_linear():
+    model, layer = _split_model(rank=2, alpha=32)
+    x = torch.randn(3, 8)
+    lora_a, lora_b = layer.lora_A["default"], layer.lora_B["default"]
+    expected = layer.base_layer(x) + 16.0 * torch.cat(
+        [lora_b.q(lora_a.q(x)), lora_b.k(lora_a.k(x)), lora_b.v(lora_a.v(x))], dim=-1
+    )
+    torch.testing.assert_close(model(x), expected)
+    torch.testing.assert_close(layer.get_delta_weight("default") @ x.T, (expected - layer.base_layer(x)).T)
+    shapes = {name: tuple(p.shape) for name, p in model.named_parameters() if p.requires_grad}
+    prefix = "base_model.model.linear_attn.in_proj_qkv"
+    assert shapes == {
+        f"{prefix}.lora_A.default.q.weight": (2, 8), f"{prefix}.lora_A.default.k.weight": (2, 8),
+        f"{prefix}.lora_A.default.v.weight": (2, 8), f"{prefix}.lora_B.default.q.weight": (4, 2),
+        f"{prefix}.lora_B.default.k.weight": (4, 2), f"{prefix}.lora_B.default.v.weight": (6, 2),
+    }
+    # Each A is initialised like PEFT's / nn.Linear's (independently, not copies).
+    assert not torch.equal(lora_a.q.weight, lora_a.k.weight)
+
+
+def test_split_names_and_legacy_fused_adapters_convert_exactly():
+    peft = pytest.importorskip("peft")
+    from peft.utils.save_and_load import get_peft_model_state_dict
+
+    model, _ = _split_model()
+    names = sorted(split_peft_name(name) for name in get_peft_model_state_dict(model))
+    assert names == sorted(
+        f"base_model.model.linear_attn.in_proj_{s}.lora_{ab}.weight" for ab in "AB" for s in "qkv"
+    )
+    assert split_peft_name("x.out_proj.lora_A.weight") == "x.out_proj.lora_A.weight"
+
+    # A legacy adapter: one LoRA on the fused Linear (shared A).
+    torch.manual_seed(1)
+    legacy = peft.get_peft_model(_GDN(), peft.LoraConfig(r=2, lora_alpha=32, target_modules=["in_proj_qkv"]))
+    fused = legacy.base_model.model.in_proj_qkv
+    torch.nn.init.normal_(fused.lora_B["default"].weight)
+    tensors = {"m.in_proj_qkv.lora_A.weight": fused.lora_A["default"].weight.detach(),
+               "m.in_proj_qkv.lora_B.weight": fused.lora_B["default"].weight.detach()}
+    split = split_legacy_tensors(tensors, (4, 4, 6))
+    assert sorted(split) == sorted(f"m.in_proj_{s}.lora_{ab}.weight" for ab in "AB" for s in "qkv")
+    x = torch.randn(3, 8)
+    delta = torch.cat([x @ split[f"m.in_proj_{s}.lora_A.weight"].T @ split[f"m.in_proj_{s}.lora_B.weight"].T
+                       for s in "qkv"], dim=-1)
+    torch.testing.assert_close(delta * 16.0, legacy(x) - fused.base_layer(x))
+
+
+def test_engine_lora_build_uses_split_qkv_and_restores_the_config_class():
+    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("peft")
+    engine = pytest.importorskip("verl.workers.engine.fsdp.transformer_impl")
+    if getattr(transformers, "Qwen3_5TextConfig", None) is None:
+        pytest.skip("transformers without Qwen3.5")
+    config = transformers.Qwen3_5TextConfig(
+        hidden_size=64, intermediate_size=128, num_hidden_layers=4, layer_types=_LAYERS_4B,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=16, linear_num_key_heads=2,
+        linear_num_value_heads=4, linear_key_head_dim=16, linear_value_head_dim=16, vocab_size=256,
+    )
+    with torch.device("meta"):
+        model = transformers.Qwen3_5ForCausalLM(config)
+    default_config = engine.LoraConfig
+    regex = r"(?:.*\.)?(?:in_proj_qkv|in_proj_z|out_proj|q_proj|k_proj|v_proj|o_proj|lm_head)"
+    built = engine.FSDPEngine._build_lora_module(_peft_engine_self(None, regex), model)
+    assert engine.LoraConfig is default_config
+    layer = built.base_model.model.model.layers[0].linear_attn.in_proj_qkv
+    assert type(layer).__name__ == "SplitQKVLoraLinear"
+    assert type(built.base_model.model.model.layers[3].self_attn.q_proj).__name__ == "Linear"

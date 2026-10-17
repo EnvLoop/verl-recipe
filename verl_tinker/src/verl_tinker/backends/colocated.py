@@ -225,40 +225,72 @@ def lora_init_seed(model_config) -> Optional[int]:
     return int(seed)
 
 
-def _patch_lora_init_seed() -> None:
-    """Make the LoRA adapter initialisation reproducible for a given seed.
+def _patch_lora_build() -> None:
+    """Build the LoRA adapter like the reference: per-slice q/k/v LoRAs and a seeded init.
 
-    VeRL's FSDP engine creates the adapter with ``get_peft_model`` (``lora_A`` Kaiming
-    uniform from the global torch RNG, ``lora_B`` zero) before FSDP wrapping, and rank 0's
-    initialised weights are what FSDP broadcasts to every rank. Seeding the RNGs
-    (CPU and the current accelerator) for just that call gives the same adapter for the
-    same seed, as Tinker's ``LoraConfig.seed`` promises; the global RNG state is restored
-    afterwards. Without a seed nothing changes. Runs at import, like the patch above.
+    * Split q/k/v (``lora_split``): every Gated DeltaNet ``in_proj_qkv`` is marked before
+      ``get_peft_model`` and VeRL's ``LoraConfig`` is swapped for one that routes it to the split
+      LoRA layer, so the fused projection trains three independent LoRAs (q, k, v) like the
+      reference. The base weight and its name are unchanged. Not for adapters loaded from
+      ``lora_adapter_path`` (PEFT rebuilds those from their own config).
+    * Seed: VeRL creates the adapter with ``get_peft_model`` (``lora_A`` Kaiming uniform from the
+      global torch RNG, ``lora_B`` zero) before FSDP wrapping, and rank 0's initialised weights are
+      what FSDP broadcasts to every rank. Seeding the RNGs (CPU and the current accelerator) for
+      just that call gives the same adapter for the same seed (``LoraConfig.seed``); the global
+      RNG state is restored afterwards. Without a seed nothing changes.
+
+    Runs at import, like the patch above.
     """
     try:
-        from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
+        from verl.workers.engine.fsdp import transformer_impl
     except Exception:  # noqa: BLE001 - a VeRL without the FSDP engine has nothing to patch
         return
+    from contextlib import ExitStack
+
+    from ..lora_split import lora_config_class, mark_split_qkv
+
+    FSDPEngine = transformer_impl.FSDPEngine
     original = FSDPEngine._build_lora_module
-    if getattr(original, "_envloop_seed_patch", False):
+    if getattr(original, "_envloop_lora_patch", False):
         return
 
     def _build_lora_module(self, module):
-        seed = lora_init_seed(self.model_config)
-        if seed is None:
-            return original(self, module)
         import torch
 
-        devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
-        with torch.random.fork_rng(devices=devices):
-            torch.manual_seed(seed)
+        with ExitStack() as stack:
+            if getattr(self.model_config, "lora_adapter_path", None) is None and mark_split_qkv(module):
+                default_config = transformer_impl.LoraConfig
+                transformer_impl.LoraConfig = lora_config_class()
+                stack.callback(setattr, transformer_impl, "LoraConfig", default_config)
+            seed = lora_init_seed(self.model_config)
+            if seed is not None:
+                devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+                stack.enter_context(torch.random.fork_rng(devices=devices))
+                torch.manual_seed(seed)
             return original(self, module)
 
+    _build_lora_module._envloop_lora_patch = True
     _build_lora_module._envloop_seed_patch = True
     FSDPEngine._build_lora_module = _build_lora_module
 
+    original_params = FSDPEngine.get_per_tensor_param
+    if getattr(original_params, "_envloop_lora_patch", False):
+        return
 
-_patch_lora_init_seed()
+    def get_per_tensor_param(self, *args, **kwargs):
+        """Adapter tensors for vLLM in PEFT file naming (``in_proj_{q,k,v}`` for the split LoRAs)."""
+        from ..lora_split import split_peft_name
+
+        params, peft_config = original_params(self, *args, **kwargs)
+        if peft_config is None:
+            return params, peft_config
+        return ((split_peft_name(name), tensor) for name, tensor in params), peft_config
+
+    get_per_tensor_param._envloop_lora_patch = True
+    FSDPEngine.get_per_tensor_param = get_per_tensor_param
+
+
+_patch_lora_build()
 
 
 class TinkerServerActorRolloutRefWorker(TinkerActorRolloutRefWorker):

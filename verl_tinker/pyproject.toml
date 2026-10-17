@@ -40,6 +40,10 @@ dependencies = [
     "kernels==0.14.1",
 ]
 
+[project.entry-points."vllm.general_plugins"]
+# Separate q/k/v LoRAs on Qwen3.5's in_proj_qkvz (see src/verl_tinker/vllm_split_qkv.py).
+verl_tinker_split_qkv_lora = "verl_tinker.vllm_split_qkv:register"
+
 [tool.setuptools.package-data]
 verl_tinker = ["vllm_backports/*.diff"]
 
