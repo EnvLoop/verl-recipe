@@ -517,3 +517,27 @@ def test_unknown_rollout_start_is_rejected():
     errors = _validate_config(config)
 
     assert "server.rollout_start must be one of ['eager', 'lazy'], got 'later'" in errors
+
+
+def test_envloop_long_context_lora_config_validates():
+    """EnvLoop's long-context knobs survive the VeRL default merge and validation."""
+    config = OmegaConf.load(_TINKER_CONFIG_DIR / "advance" / "qwen35_4b_long_context_lora.yaml")
+
+    processed = process_actor_rollout_ref_config(config)
+    errors = _validate_config(processed)
+
+    assert errors == []
+    actor = processed.actor_rollout_ref.actor
+    rollout = processed.actor_rollout_ref.rollout
+    model = processed.actor_rollout_ref.model
+    assert actor.fsdp_config.ulysses_sequence_parallel_size == 2
+    assert (actor.use_dynamic_bsz, actor.ppo_max_token_len_per_gpu) == (True, 131073)
+    assert (rollout.log_prob_use_dynamic_bsz, rollout.log_prob_max_token_len_per_gpu) == (True, 131073)
+    # One 256K datum (model input + final target) fits one SP micro-batch.
+    assert actor.ppo_max_token_len_per_gpu * actor.fsdp_config.ulysses_sequence_parallel_size >= 262144 + 1
+    assert (rollout.max_model_len, rollout.max_num_batched_tokens, rollout.enable_chunked_prefill) == (
+        262144, 8192, True)
+    assert (model.use_remove_padding, model.enable_gradient_checkpointing, model.use_fused_kernels) == (
+        True, True, True)
+    assert model.fused_kernel_options.impl_backend == "torch"
+    assert model.external_lib == "verl_tinker.verl_patches"

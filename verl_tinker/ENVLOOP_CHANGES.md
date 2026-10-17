@@ -344,3 +344,83 @@ Validation: CPU suite (`tests/test_colocated_backend.py`, `tests/test_model_reso
 `tests/test_tinker_router.py`, `tests/test_config_utils.py`); GPU `tests/gpu/test_envloop_lazy_rollout_gpu.py`
 (training without vLLM, first sampler save starts it, sample/compute_logprobs/trainer agreement, another
 train/sync/sample cycle; `TINKER_LAZY_TRAIN_ONLY=1` for actor-only shapes).
+
+## Long context (64K standard, 256K `:peft:262144` variants)
+
+EnvLoop serves Qwen3.5-4B / Qwen3.8-27B with a 64K standard context and
+256K long-context variants. The EnvPlatform guest overlay
+(`trainingmaster-actor-rollout.yaml`) maps each model profile onto VeRL's
+existing knobs. This fork reports the context window, fixes two VeRL problems
+in the fused log-prob path, and documents a validated configuration.
+
+* `get_supported_models` reports `rollout.max_model_len` as
+  `max_context_length` when it is set. It used to report
+  `rollout.max_response_length`, which has nothing to do with the window.
+* `src/verl_tinker/verl_patches.py` (new) is loaded in every worker through
+  `actor_rollout_ref.model.external_lib: verl_tinker.verl_patches` (VeRL's
+  `HFModelConfig` imports it before the model is built; EnvPlatform's guest
+  sets it only when the recipe ships the module). VeRL's fused log-prob path
+  (`use_fused_kernels`; still the same on upstream main 2026-10-16) reads
+  `self.lm_head.weight` instead of calling `lm_head`. The patch fixes both
+  consequences:
+  1. FSDP2 wraps an untied `lm_head` (Qwen3.8-27B) as its own unit, and the
+     direct read fails after backward with `'FSDPParam' object has no
+     attribute '_unsharded_param'`. The patch keeps `lm_head` (and any LoRA
+     children) in the root unit; `verl.utils.fsdp_utils._select_fsdp2_wrap_targets`
+     is wrapped.
+  2. With LoRA on `lm_head` (Tinker `train_unembed`), `.weight` is the frozen
+     base weight, so the adapter was silently ignored. The qwen3_5
+     `forward_with_torch_backend` / `forward_with_triton_backend` (copied from
+     VeRL, Apache-2.0, only the `vocab_weights` line changed) use
+     `W + scaling * B @ A` instead, which is differentiable in A and B. DoRA
+     and a non-zero `lora_dropout` on `lm_head` are refused.
+* `configs/advance/qwen35_4b_long_context_lora.yaml` +
+  `tests/test_config_utils.py::test_envloop_long_context_lora_config_validates`:
+  the settings EnvLoop derives from a profile survive the VeRL default merge
+  and validation:
+  * `actor.fsdp_config.ulysses_sequence_parallel_size` (Ulysses SP). VeRL's
+    `qwen3_5` patch runs the GatedDeltaNet linear-attention layers with FLA
+    context parallelism (`fla.ops.cp`, present in fla 0.4.2). Heads limit SP:
+    4B allows SP ≤ 16; 27B (24 heads, 4 KV heads) allows SP 1/2/4/8.
+  * `actor.use_dynamic_bsz` + `ppo_max_token_len_per_gpu`, mirrored by
+    `rollout.log_prob_*` (VeRL asserts they match).
+  * `model.use_remove_padding`, `enable_gradient_checkpointing`,
+    `use_fused_kernels` (`impl_backend: torch`), `external_lib`.
+  * `rollout.max_model_len`, `max_num_batched_tokens`, chunked prefill.
+* No RoPE scaling is needed: both models' `max_position_embeddings` is 262144
+  with `rope_type: default`.
+* Token budget: a datum reaches VeRL as its model input plus the final target
+  token, so `ppo_max_token_len_per_gpu * SP` must be at least context + 1.
+  Otherwise VeRL asserts `max_token_len must be greater than the sequence
+  length`.
+* Fused log-prob kernels are required from about 64K tokens. Unfused, the
+  `[tokens, 248320]` logits of a 64K Qwen3.5 datum do not fit next to the
+  model.
+* EnvLoop's long-context profiles use the FSDP2 actor, including Qwen3.8-27B.
+  Without the per-unit collector above, FSDP1's first rollout weight sync
+  (`collect_lora_params`, base weights not yet synced, `layered_summon=False`)
+  summons the whole module on the GPU. On two H200s this put 109 GiB on the
+  actor next to vLLM; the sync ran out of memory even after a 4K step and left
+  the actor broken. FSDP2 streams each full tensor to the CPU (first sync
+  about 107 s, no extra GPU memory). At 64K, FSDP2 + SP2 + fused needs
+  81.7 GiB per GPU versus 121 GiB for FSDP1 + SP2.
+  This path keeps `rollout.load_format: dummy` and `layered_summon: false`, the
+  configuration measured here. FSDP2 with the per-unit collector and
+  `safetensors` was not measured (see the note above: the earlier crash came
+  from R595-driver hosts, not from safetensors).
+
+Validation: CPU suite `python -m pytest -q tests --ignore=tests/gpu` passes
+(the fused-path test needs CUDA; it passed on one H200, and EnvLoop's W1 ran
+an lm_head-only LoRA through it on one H100: loss fell 116.7 → 44.3 over 12
+steps, sampler vs actor 0.0015).
+GPU, 2026-10-17, Verda 4x H200, `install_verl.sh` environment, colocated head,
+LoRA rank 32, one cross-entropy datum, then a long-prompt sample:
+
+| setup | context | peak/GPU | step | sample |
+|---|---|---|---|---|
+| 4B, 1 GPU, FSDP2, fused | 64K | 46.7 GiB | 11.9 s | 65K prompt 2.6 s |
+| 4B, 2 GPUs, FSDP2, SP2, fused | 256K | 79.7 GiB | 113 s | 262K prompt 13 s |
+| 27B, 2 GPUs, FSDP2, SP2, fused + patch | 64K | 81.7 GiB | 44.9 s | 65K prompt 5.7 s |
+| 27B, 4 GPUs, FSDP2, SP4, fused + patch | 256K | 114.6 GiB | 373 s | 262K prompt 28 s |
+
+The full table is in EnvPlatform `docs/training/design/context-length.md`.
