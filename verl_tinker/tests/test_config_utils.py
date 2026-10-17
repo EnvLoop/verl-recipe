@@ -262,6 +262,7 @@ def test_multi_teacher_config_uses_dedicated_pools_and_validates_gpu_footprints(
 
 
 def test_qwen3_8b_actor_rollout_lora_config_validates():
+    pytest.importorskip("vllm")  # VeRL config validation checks the installed vLLM version
     config = OmegaConf.load(_TINKER_CONFIG_DIR / "advance" / "qwen3_8b_actor_rollout_lora.yaml")
 
     processed = process_actor_rollout_ref_config(config)
@@ -521,6 +522,7 @@ def test_unknown_rollout_start_is_rejected():
 
 def test_envloop_long_context_lora_config_validates():
     """EnvLoop's long-context knobs survive the VeRL default merge and validation."""
+    pytest.importorskip("vllm")  # VeRL config validation checks the installed vLLM version
     config = OmegaConf.load(_TINKER_CONFIG_DIR / "advance" / "qwen35_4b_long_context_lora.yaml")
 
     processed = process_actor_rollout_ref_config(config)
