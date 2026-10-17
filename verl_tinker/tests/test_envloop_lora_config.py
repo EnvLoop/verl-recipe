@@ -25,7 +25,7 @@ import torch
 from fastapi import HTTPException
 from omegaconf import OmegaConf
 from test_envloop_router_alignment import _server
-from verl_tinker import capabilities, vllm_backports, vllm_split_qkv
+from verl_tinker import capabilities, vllm_backports, vllm_lora_determinism, vllm_split_qkv
 from verl_tinker.backends.colocated import lora_init_seed
 from verl_tinker.lora_info import configured_lora_info
 from verl_tinker.lora_split import lora_config_class, mark_split_qkv, split_legacy_tensors, split_peft_name
@@ -290,11 +290,16 @@ def test_capability_reports_only_verified_backports(tmp_path, monkeypatch):
     monkeypatch.setattr(vllm_split_qkv, "enabled", lambda vllm_root: vllm_root == root)
     with pytest.raises(vllm_backports.BackportError):
         capabilities.assert_startup_capabilities()
-    assert capabilities.runtime_capabilities() == {"lm_head_lora_prompt_logprobs": False, "lora_split_qkv": True}
+    monkeypatch.setattr(vllm_lora_determinism, "current_device_name", lambda: None)
+    assert capabilities.runtime_capabilities() == {
+        "lm_head_lora_prompt_logprobs": False,
+        "lora_split_qkv": True,
+        "lora_deterministic": False,
+    }
 
     vllm_backports.apply_installed()
     capabilities.assert_startup_capabilities()
-    assert capabilities.runtime_capabilities() == {"lm_head_lora_prompt_logprobs": True, "lora_split_qkv": True}
+    assert capabilities.runtime_capabilities()["lm_head_lora_prompt_logprobs"] is True
     assert vllm_backports.present(root, "9.9.9")  # a release without diffs ships the fixes
     capabilities.runtime_capabilities.cache_clear()
 
@@ -630,30 +635,76 @@ def _vllm_tuned_lookup(config_data: dict, max_loras: int, num_slices: int, m: in
     return pick(pick(pick(pick(config_data, max_loras)[str(num_slices)], m), k), n)
 
 
-def test_rollout_lora_shrink_configs_never_split_k(monkeypatch):
-    from verl_tinker import vllm_lora_determinism
+# torch.cuda.get_device_name() -> the file vLLM opens (spaces and dashes -> "_"), for every catalog GPU.
+CATALOG_GPU_FILES = {
+    "NVIDIA H100 80GB HBM3": "NVIDIA_H100_80GB_HBM3_SHRINK.json",
+    "NVIDIA H100 PCIe": "NVIDIA_H100_PCIe_SHRINK.json",
+    "NVIDIA H100 NVL": "NVIDIA_H100_NVL_SHRINK.json",
+    "NVIDIA H200": "NVIDIA_H200_SHRINK.json",
+    "NVIDIA H200 NVL": "NVIDIA_H200_NVL_SHRINK.json",
+    "NVIDIA B200": "NVIDIA_B200_SHRINK.json",
+    "NVIDIA A100-SXM4-80GB": "NVIDIA_A100_SXM4_80GB_SHRINK.json",
+    "NVIDIA A100-SXM4-40GB": "NVIDIA_A100_SXM4_40GB_SHRINK.json",
+    "NVIDIA A100 80GB PCIe": "NVIDIA_A100_80GB_PCIe_SHRINK.json",
+    "NVIDIA A100-PCIE-40GB": "NVIDIA_A100_PCIE_40GB_SHRINK.json",
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": "NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition_SHRINK.json",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": (
+        "NVIDIA_RTX_PRO_6000_Blackwell_Workstation_Edition_SHRINK.json"
+    ),
+}
 
-    files = sorted(vllm_lora_determinism.CONFIG_DIR.glob("*_SHRINK.json"))
-    assert {f.name for f in files} >= {
-        "NVIDIA_H100_80GB_HBM3_SHRINK.json",
-        "NVIDIA_H200_SHRINK.json",
-        "NVIDIA_B200_SHRINK.json",
-    }
-    for path in files:
-        data = json.loads(path.read_text())
-        for max_loras in (1, 4, 16):
-            for num_slices in (1, 2, 3, 4):
-                for m in (1, 22, 127, 128, 8192):
-                    config = _vllm_tuned_lookup(data, max_loras, num_slices, m, 5120, 128)
-                    assert config["split_k"] == 1, (path.name, num_slices, m)
-                    assert {"block_m", "block_n", "block_k", "num_warps", "num_stages"} <= set(config)
 
+@pytest.mark.parametrize("device_name", sorted(CATALOG_GPU_FILES))
+def test_every_catalog_gpu_gets_a_split_k_1_lora_shrink_config(device_name, tmp_path):
+    name = vllm_lora_determinism.shrink_config_name(device_name)
+    assert name == CATALOG_GPU_FILES[device_name]
+    data = json.loads((vllm_lora_determinism.CONFIG_DIR / name).read_text())
+    for max_loras in (1, 4, 16):
+        for num_slices in (1, 2, 3, 4):
+            for m in (1, 22, 127, 128, 8192):
+                config = _vllm_tuned_lookup(data, max_loras, num_slices, m, 5120, 128)
+                assert config["split_k"] == 1, (num_slices, m)
+                assert {"block_m", "block_n", "block_k", "num_warps", "num_stages"} <= set(config)
+    environ = {}
+    vllm_lora_determinism.enable(environ)
+    assert vllm_lora_determinism.deterministic(device_name, environ)
+    vllm_lora_determinism.write_configs(tmp_path, [device_name])  # the shipped files are the generator's output
+    assert (tmp_path / name).read_text() == (vllm_lora_determinism.CONFIG_DIR / name).read_text()
+
+
+def test_shipped_lora_shrink_configs_are_exactly_the_catalog():
+    shipped = {path.name for path in vllm_lora_determinism.CONFIG_DIR.glob("*.json")}
+    assert shipped == set(CATALOG_GPU_FILES.values())
+    assert set(vllm_lora_determinism.DEVICE_NAMES) == set(CATALOG_GPU_FILES)
+
+
+def test_lora_determinism_env_and_unknown_gpu(tmp_path, monkeypatch, caplog):
     environ = {}
     vllm_lora_determinism.enable(environ)
     assert environ == {"VLLM_TUNED_CONFIG_FOLDER": str(vllm_lora_determinism.CONFIG_DIR)}
     environ = {"VLLM_TUNED_CONFIG_FOLDER": "/opt/tuned"}
     vllm_lora_determinism.enable(environ)
     assert environ == {"VLLM_TUNED_CONFIG_FOLDER": "/opt/tuned"}  # the operator's folder wins
+    assert not vllm_lora_determinism.deterministic("NVIDIA H200", environ)  # no such file there
     environ = {"VLLM_BATCH_INVARIANT": "1"}
     vllm_lora_determinism.enable(environ)
     assert environ == {"VLLM_BATCH_INVARIANT": "1"}  # vLLM ignores tuned configs then
+    assert vllm_lora_determinism.deterministic(None, environ)  # and is deterministic by itself
+
+    shipped = {"VLLM_TUNED_CONFIG_FOLDER": str(vllm_lora_determinism.CONFIG_DIR)}
+    assert not vllm_lora_determinism.deterministic("NVIDIA L40S", shipped)
+    assert not vllm_lora_determinism.deterministic(None, shipped)  # no GPU / NVML
+    (tmp_path / "NVIDIA_L40S_SHRINK.json").write_text(json.dumps({"1": {"1": {"1": {"1": {"1": {"split_k": 64}}}}}}))
+    assert not vllm_lora_determinism.deterministic("NVIDIA L40S", {"VLLM_TUNED_CONFIG_FOLDER": str(tmp_path)})
+
+    monkeypatch.setattr(vllm_lora_determinism, "current_device_name", lambda: "NVIDIA L40S")
+    with caplog.at_level("WARNING"):
+        assert vllm_lora_determinism.check(shipped) is False
+    assert "NVIDIA_L40S_SHRINK.json" in caplog.text and "lora_deterministic=false" in caplog.text
+    capabilities.runtime_capabilities.cache_clear()
+    monkeypatch.setenv("VLLM_TUNED_CONFIG_FOLDER", str(vllm_lora_determinism.CONFIG_DIR))
+    assert capabilities.runtime_capabilities()["lora_deterministic"] is False
+    capabilities.runtime_capabilities.cache_clear()
+    monkeypatch.setattr(vllm_lora_determinism, "current_device_name", lambda: "NVIDIA H200")
+    assert capabilities.runtime_capabilities()["lora_deterministic"] is True
+    capabilities.runtime_capabilities.cache_clear()

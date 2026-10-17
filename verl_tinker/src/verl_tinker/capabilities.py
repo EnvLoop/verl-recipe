@@ -22,13 +22,16 @@ contains both fixes, so a head whose backports failed (or were never applied) re
 ``LORA_SPLIT_QKV``: the rollout's vLLM serves adapters with separate ``in_proj_{q,k,v}`` LoRAs (the layout
 ``verl_tinker.lora_split`` trains) through the ``vllm_split_qkv`` general plugin. True when vLLM will load the
 plugin (entry point installed, not excluded by ``VLLM_PLUGINS``, hooks present in the installed vLLM).
+
+``lora_deterministic`` (reported, not declared): the rollout's LoRA kernels give bit-identical results for repeated
+requests on this GPU (``vllm_lora_determinism``); False on a GPU without a ``split_k=1`` shrink config.
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
 
-from . import vllm_backports, vllm_split_qkv
+from . import vllm_backports, vllm_lora_determinism, vllm_split_qkv
 
 # This recipe version ships the backports.
 LM_HEAD_LORA_PROMPT_LOGPROBS = True
@@ -41,6 +44,7 @@ def runtime_capabilities() -> dict[str, bool]:
     return {
         "lm_head_lora_prompt_logprobs": LM_HEAD_LORA_PROMPT_LOGPROBS and vllm_backports.present_installed(),
         "lora_split_qkv": LORA_SPLIT_QKV and vllm_split_qkv.enabled(vllm_backports.installed_root()),
+        "lora_deterministic": vllm_lora_determinism.deterministic(vllm_lora_determinism.current_device_name()),
     }
 
 

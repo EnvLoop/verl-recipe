@@ -510,7 +510,13 @@ end to end (EnvPlatform: `lora_targets.py`, guest overlay; this repo: the pieces
   and reduces with float `atomic_add` (vllm-project/vllm#50059; fix #50278 still open), so the rollout scores the
   same prompt differently from one request to the next. `verl_tinker.start` sets `VLLM_TUNED_CONFIG_FOLDER` (vLLM's
   tuned-kernel-config knob; an operator's own folder wins, `VLLM_BATCH_INVARIANT=1` is left alone) to
-  `vllm_lora_configs/`: `shrink` configs with `split_k=1` per GPU name (H100, H200, B200, A100 variants). Searched
+  `vllm_lora_configs/`: `shrink` configs with `split_k=1` for every catalog GPU name (H100 80GB HBM3 / PCIe / NVL,
+  H200 / H200 NVL, B200, A100-SXM4-80GB / -40GB, A100 80GB PCIe / A100-PCIE-40GB, RTX PRO 6000 Blackwell Server /
+  Workstation Edition), named the way vLLM looks them up (`torch.cuda.get_device_name()` with spaces and dashes
+  replaced by `_`; names checked against vLLM's own tuned-config file names and vLLM startup logs). On a GPU
+  without a file vLLM silently falls back to the nondeterministic default, so startup logs a warning and the head
+  reports `capabilities.lora_deterministic` (False there; GPU name read through vLLM's NVML platform, no CUDA
+  context). `python -m verl_tinker.vllm_lora_determinism` regenerates the files from `DEVICE_NAMES`. Searched
   vLLM 0.26-0.31 and upstream PRs: #59377 (merged, 0.32+) only covers `VLLM_BATCH_INVARIANT=1`, which swaps many
   other kernels; the tuned folder is the narrowest existing knob. 27B, 2x H200 SXM (driver 615.71.09), FSDP2 + SP2
   + fused + rollout TP 2 (#463 rendering), rank 8 all layers after 8 training steps, same prompt (e2e anchor, 28

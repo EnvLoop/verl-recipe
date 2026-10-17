@@ -155,6 +155,7 @@ def main() -> None:
 
     apply_installed()
     vllm_lora_determinism.enable()
+    vllm_lora_determinism.check()
     assert_startup_capabilities()
 
     config = load_config(sys.argv[2])
