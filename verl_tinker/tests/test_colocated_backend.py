@@ -1066,3 +1066,39 @@ def test_reset_optimizer_state_makes_the_next_adam_step_a_first_step():
     step(fresh_module, fresh_optimizer, 5.0)
     for a, b in zip(after_reset, fresh_module.parameters(), strict=True):
         torch.testing.assert_close(a, b.detach())
+
+
+def test_oversized_cpu_weight_is_sent_from_the_device(monkeypatch):
+    """FSDP1 gathers CPU tensors; oversized ones must not be CUDA-IPC shared from host memory."""
+    from types import SimpleNamespace
+
+    from verl_tinker.backends import colocated
+
+    import verl.utils.device as device_utils
+
+    monkeypatch.setattr(device_utils, "get_device_name", lambda: "cuda")
+    monkeypatch.setattr(device_utils, "get_device_id", lambda: 3)
+    moves = []
+
+    class FakeTensor:
+        def __init__(self, device_type):
+            self.device = SimpleNamespace(type=device_type)
+
+        def to(self, device):
+            moves.append(device)
+            return FakeTensor("cuda")
+
+    on_host = colocated._on_sender_device(FakeTensor("cpu"))
+    assert on_host.device.type == "cuda" and moves == ["cuda:3"]
+    on_device = FakeTensor("cuda")
+    assert colocated._on_sender_device(on_device) is on_device and moves == ["cuda:3"]
+
+
+def test_bucketed_sender_direct_send_is_patched():
+    """With vLLM installed (GPU hosts), VeRL's sender routes oversized weights through the device move."""
+    pytest.importorskip("vllm")
+    import verl_tinker.backends.colocated  # noqa: F401 - applies the patch at import
+
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
+
+    assert getattr(BucketedWeightSender._direct_send_large_weight, "_envloop_device_patch", False)
