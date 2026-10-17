@@ -528,3 +528,20 @@ async def test_save_state_creates_router_local_directory_for_metadata(monkeypatc
     assert saved_state_paths == {uri: str(local_dir)}
     assert saved_state_metadata == {uri: {"epoch": 1}}
     assert (local_dir / "metadata.json").read_text() == '{"epoch": 1}\n'
+
+
+def test_supported_models_report_the_rollout_window_as_context():
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+    from verl_tinker.tinker_ops import get_supported_models
+
+    def engine(rollout):
+        return SimpleNamespace(config=OmegaConf.create(
+            {"server": {"model_name": "Qwen/Qwen3.5-4B"}, "actor_rollout_ref": {"rollout": rollout}}))
+
+    windowed = get_supported_models(engine({"max_model_len": 65536, "max_response_length": 512}))
+    unset = get_supported_models(engine({"max_model_len": None, "max_response_length": 512}))
+
+    assert windowed["supported_models"] == [{"model_name": "Qwen/Qwen3.5-4B", "max_context_length": 65536}]
+    assert unset["supported_models"] == [{"model_name": "Qwen/Qwen3.5-4B", "max_context_length": 512}]

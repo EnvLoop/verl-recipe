@@ -98,10 +98,14 @@ def get_supported_models(engine, teacher_backend=None) -> dict:
         model_name = get_configured_model_name(engine)
     except Exception:
         model_name = None
-    try:
-        max_ctx = int(engine.config.actor_rollout_ref.rollout.max_response_length)
-    except Exception:
-        max_ctx = 4096
+    # EnvLoop: the vLLM window (rollout.max_model_len) is the context a client
+    # can use; fall back to the upstream field when it is unset.
+    max_ctx = _configured_max_model_len(engine)
+    if max_ctx is None:
+        try:
+            max_ctx = int(engine.config.actor_rollout_ref.rollout.max_response_length)
+        except Exception:
+            max_ctx = 4096
     supported_models = [{"model_name": model_name, "max_context_length": max_ctx}]
     if teacher_backend is not None:
         for descriptor in teacher_backend.descriptors:

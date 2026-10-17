@@ -1,0 +1,70 @@
+# EnvLoop: Qwen3.5-4B LoRA actor + colocated vLLM rollout with a 256K context
+# (Tinker's "Qwen/Qwen3.5-4B:peft:262144"). Mirrors the settings EnvLoop's guest
+# overlay (EnvPlatform trainingmaster-actor-rollout.yaml) derives from a model
+# profile; see ENVLOOP_CHANGES.md "Long context".
+#
+# - Qwen3.5's native max_position_embeddings is 262144 (rope_type default), so
+#   no RoPE scaling is configured.
+# - Ulysses SP shards each sequence over ulysses_sequence_parallel_size GPUs;
+#   VeRL's qwen3_5 patch runs the linear-attention (GatedDeltaNet) layers with
+#   FLA context parallelism (fla.ops.cp).
+# - use_fused_kernels computes token log-probs without materializing the
+#   [tokens, 248320] logits.
+# - The dynamic-batch budget is per GPU and multiplied by the SP degree; one
+#   datum reaches VeRL as model_input + its final target token, so the budget
+#   must cover context + 1 tokens.
+
+server:
+  model_name: ${oc.env:TINKER_SERVER_MODEL_NAME,Qwen/Qwen3.5-4B}
+  host: ${oc.env:TINKER_SERVER_HOST,0.0.0.0}
+  port: ${oc.env:TINKER_SERVER_PORT,8000}
+  ray_address: ${oc.env:RAY_ADDRESS,local}
+  checkpoint_dir: ${oc.env:TINKER_CHECKPOINT_DIR,/tmp/tinker-checkpoints}
+  enable_offload: true
+  auto_merge_verl_default_config: true
+
+actor_rollout_ref:
+  actor:
+    # EnvLoop's guest adapter switches this to fsdp2 after the default merge,
+    # which only knows "fsdp"; both work with the settings below.
+    strategy: fsdp
+    ppo_mini_batch_size: 16
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 131073
+    fsdp_config:
+      model_dtype: bfloat16
+      param_offload: false
+      optimizer_offload: false
+      use_orig_params: true
+      ulysses_sequence_parallel_size: 2
+    optim:
+      lr_scheduler_type: constant
+      lr: 1.0e-6
+  rollout:
+    name: vllm
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.4
+    max_model_len: 262144
+    max_num_batched_tokens: 8192
+    enable_chunked_prefill: true
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 131073
+    layered_summon: false
+  ref:
+    enable: false
+  model:
+    path: ${oc.env:TINKER_SERVER_MODEL_PATH,Qwen/Qwen3.5-4B}
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+    use_fused_kernels: true
+    fused_kernel_options:
+      impl_backend: torch
+    # Fused kernels with FSDP2 + untied lm_head, and with LoRA on lm_head.
+    external_lib: verl_tinker.verl_patches
+    lora_rank: 32
+    lora_alpha: 32
+    target_modules: all-linear
+
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 2
