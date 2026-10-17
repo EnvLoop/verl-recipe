@@ -59,6 +59,12 @@ The tracked concepts are:
   starts it with ``lazy_rollout_plan``: vLLM's own base weights serve version
   zero when it loads them from disk; otherwise the start pushes the actor's
   current version.
+* Sampler adapters (EnvLoop): a sampler checkpoint whose weights are no longer in the
+  rollout is served as an extra vLLM LoRA adapter loaded from its PEFT export, beside the
+  current weights.  ``sampler-adapter://<tag>`` binds such an adapter directly
+  (a checkpoint the EnvLoop gateway staged into the checkpoint root); an actor-version
+  binding whose version left the rollout falls back to the training-state checkpoint saved
+  at that version (``adapter_state_paths``), if any.
 
 Optimizer, gradient, and broader training-state equivalence are deliberately not
 modeled.  In particular, actor-version equality means only that the tracked model
@@ -71,6 +77,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
+
+from .sampler_adapters import adapter_tag
 
 
 class ModelResourceManagerError(ValueError):
@@ -103,6 +111,7 @@ class SamplingResource(str, Enum):
     ROLLOUT = "rollout"
     ACTOR = "actor"
     REFERENCE = "reference"
+    ADAPTER = "adapter"
 
 
 @dataclass(frozen=True)
@@ -114,10 +123,15 @@ class SamplerBinding:
     model_path: str | None = None
     teacher_model_path: str | None = None
     actor_id: int | None = None
+    adapter_path: str | None = None
 
     @property
     def is_teacher(self) -> bool:
         return self.teacher_model_path is not None
+
+    @property
+    def is_adapter(self) -> bool:
+        return self.adapter_path is not None
 
 
 class ModelResourceManager:
@@ -150,6 +164,7 @@ class ModelResourceManager:
         self._reference_enabled = False
 
         self._state_path_to_actor_id: dict[str, int] = {}
+        self._actor_id_to_state_paths: dict[int, dict[str, None]] = {}
         self._sampler_path_to_actor_id: dict[str, int] = {}
         self._samplers: dict[str, SamplerBinding] = {}
         self._next_session_id = 0
@@ -284,7 +299,14 @@ class ModelResourceManager:
 
     def state_saved(self, path: str) -> int:
         self._state_path_to_actor_id[path] = self.actor_id
+        self._actor_id_to_state_paths.setdefault(self.actor_id, {})[path] = None
         return self.actor_id
+
+    def adapter_state_paths(self, actor_id: int | None) -> list[str]:
+        """Training-state paths saved at ``actor_id``, newest first (sampler adapter fallback)."""
+        if actor_id is None:
+            return []
+        return list(reversed(self._actor_id_to_state_paths.get(actor_id, {})))
 
     def is_state_path(self, path: str) -> bool:
         return path in self._state_path_to_actor_id
@@ -298,6 +320,7 @@ class ModelResourceManager:
         if saved_actor_id is None:
             saved_actor_id = self._allocate_actor_id()
             self._state_path_to_actor_id[path] = saved_actor_id
+            self._actor_id_to_state_paths.setdefault(saved_actor_id, {})[path] = None
         self.actor_id = saved_actor_id
         return self.actor_id
 
@@ -365,6 +388,18 @@ class ModelResourceManager:
                 base_model=base_model or target,
                 model_path=teacher_model_path,
             )
+        elif adapter_tag(model_path) is not None:
+            if base_model is not None and base_model not in self.actor_model_identifiers:
+                raise ModelResourceManagerError(
+                    f"Sampler adapter base_model must be one of "
+                    f"{sorted(self.actor_model_identifiers)!r}, got {base_model!r}"
+                )
+            binding = SamplerBinding(
+                sampler_id=sampler_id,
+                base_model=base_model or self.actor_base_model,
+                model_path=model_path,
+                adapter_path=model_path,
+            )
         elif model_path is not None:
             if self.is_state_path(model_path):
                 raise ModelResourceManagerError(f"Training-state checkpoint cannot be sampled: {model_path}")
@@ -426,6 +461,10 @@ class ModelResourceManager:
         """Late-bind a session's weights to a resource that can fulfill the request."""
         if binding.is_teacher:
             return SamplingResource.TEACHER
+        if binding.is_adapter:
+            if not self._rollout_enabled:
+                raise StaleSamplerError(f"Sampler adapter {binding.adapter_path!r} needs a rollout")
+            return SamplingResource.ADAPTER
 
         if binding.actor_id is None:
             raise ModelResourceManagerError(f"Training sampling session {binding.sampler_id!r} has no actor ID")
@@ -456,6 +495,7 @@ class ModelResourceManager:
             sampler_id
             for sampler_id, binding in self._samplers.items()
             if binding.is_teacher
+            or (binding.is_adapter and self._rollout_enabled)
             or (
                 binding.actor_id is not None
                 and (
