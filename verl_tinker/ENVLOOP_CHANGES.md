@@ -506,7 +506,8 @@ end to end (EnvPlatform: `lora_targets.py`, guest overlay; this repo: the pieces
   `max_lora_rank`, the next value of `MaxLoRARanks`); EnvLoop still only accepts Tinker's
   powers of two.
 
-GPU validation (2026-10-17, 2x H100 80GB SXM, Vast, driver 615.71, vLLM 0.26.0 / peft 0.18.1 /
+GPU validation of the first revision (fused `in_proj_qkv` LoRA, before the split below; the q/k/v-split
+results are in their own table) (2026-10-17, 2x H100 80GB SXM, Vast, driver 615.71, vLLM 0.26.0 / peft 0.18.1 /
 transformers 5.9.0 from `uv.lock`, installed with `install_verl.sh`; server started like an
 EnvLoop guest: EnvPlatform `trainingmaster-actor-rollout.yaml` + `recipe_server.py` + the
 `TINKER_*` env EnvPlatform's `plan_model` renders; `tests/gpu/test_envloop_lora_gpu.py`):
