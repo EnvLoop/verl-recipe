@@ -177,6 +177,7 @@ async def _sampled_topk_logprobs(
     tokens: list[int],
     k: int,
     base_params: dict[str, Any],
+    lora: dict | None = None,
 ) -> list[list[tuple[int, float]] | None]:
     """Top-k logprobs at every sampled position (``SampledSequence.topk_logprobs``).
 
@@ -206,6 +207,7 @@ async def _sampled_topk_logprobs(
             request_id=uuid.uuid4().hex,
             prompt_ids=list(prompt_ids) + list(scored_tokens),
             sampling_params=dict(params),
+            **_lora_kwargs(lora),
         )
 
     # The scoring request needs one token of generation headroom. When the
@@ -573,7 +575,16 @@ def _scalar_prompt_logprobs(raw: list, prompt_len: int) -> list[float | None]:
     return [None] + scored[: max(0, prompt_len - 1)]
 
 
-async def sample(engine, req) -> dict:
+def _lora_kwargs(lora: dict | None) -> dict:
+    return {"lora": lora} if lora is not None else {}
+
+
+async def sample(engine, req, *, lora: dict | None = None) -> dict:
+    """Tinker ``asample`` on the rollout; ``lora`` decodes with a loaded sampler adapter.
+
+    A sampler adapter is a saved checkpoint, not the actor: its prompt logprobs come from the
+    rollout together with the samples, never from the actor.
+    """
     prompt_ids = list(req.prompt.to_ints())
     num_samples = int(req.num_samples)
     if num_samples <= 0:
@@ -603,6 +614,7 @@ async def sample(engine, req) -> dict:
             request_id=uuid.uuid4().hex,
             prompt_ids=prompt_ids,
             sampling_params=per_sample_params,
+            **_lora_kwargs(lora),
         )
 
     results = await asyncio.gather(*[_generate_one(i) for i in range(num_samples)])
@@ -620,7 +632,7 @@ async def sample(engine, req) -> dict:
     if topk_sample > 0:
         topk_rows = await asyncio.gather(
             *[
-                _sampled_topk_logprobs(engine, prompt_ids, sequence["tokens"], topk_sample, sampling_params)
+                _sampled_topk_logprobs(engine, prompt_ids, sequence["tokens"], topk_sample, sampling_params, lora)
                 for sequence in sequences
             ]
         )
@@ -649,7 +661,7 @@ async def sample(engine, req) -> dict:
         scalar_params = {k: v for k, v in sampling_params.items() if k not in {"stop", "stop_token_ids"}}
         scalar_params.update(max_tokens=1, prompt_logprobs=0)
         scalar = await engine.generate(
-            request_id=uuid.uuid4().hex, prompt_ids=prompt_ids, sampling_params=scalar_params
+            request_id=uuid.uuid4().hex, prompt_ids=prompt_ids, sampling_params=scalar_params, **_lora_kwargs(lora)
         )
         scalar_raw = (getattr(scalar, "extra_fields", None) or {}).get("prompt_logprobs")
         if scalar_raw is not None:

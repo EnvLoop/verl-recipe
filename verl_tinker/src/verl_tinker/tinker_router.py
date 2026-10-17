@@ -51,6 +51,16 @@ from .model_resource_manager import (
     StaleSamplerError,
     UnknownSamplerError,
 )
+from .sampler_adapters import (
+    ADAPTER_DIR,
+    SamplerAdapterError,
+    SamplerAdapterIds,
+    SamplerAdapterNotFound,
+    adapter_dir,
+    adapter_tag,
+    check_adapter_compatible,
+    read_adapter_config,
+)
 from .schemas import (
     StatusResponse,
     TinkerCreateModelRequest,
@@ -228,6 +238,7 @@ class TinkerServer:
         self._error: Optional[str] = None
         self._engine: Optional[ColocatedBackend] = None
         self._teacher_backend: Optional[TeacherInferenceBackend] = None
+        self._sampler_adapters: Optional[SamplerAdapterIds] = None
         self._gpu_executor = ThreadPoolExecutor(max_workers=1)
         self._op_gate = FifoReadWriteGate(
             max_readers=config["server"].get("max_concurrent_samples", 16),
@@ -543,6 +554,48 @@ class TinkerServer:
                 raise
             manager.rollout_started(plan)
 
+    # ==================== Sampler adapters (EnvLoop) ====================
+
+    def _sampler_adapter_error(self, exc: SamplerAdapterError) -> HTTPException:
+        if isinstance(exc, SamplerAdapterNotFound):
+            return _typed_error(HTTPStatus.NOT_FOUND, exc.code, str(exc))
+        return _typed_error(HTTPStatus.UNPROCESSABLE_ENTITY, exc.code, str(exc))
+
+    def _checked_adapter_dir(self, path: Path) -> Path:
+        """Raise unless this head can serve the PEFT adapter at ``path`` beside its current weights."""
+        engine = self._get_engine()
+        if getattr(self, "_sampler_adapters", None) is None:
+            raise SamplerAdapterError("this server has no spare LoRA slots for sampler checkpoints")
+        check_adapter_compatible(
+            read_adapter_config(path),
+            max_lora_rank=engine.sampler_max_lora_rank,
+            unembed_enabled=engine.sampler_unembed_enabled,
+            split_qkv_enabled=engine.sampler_split_qkv_enabled,
+        )
+        return path
+
+    def _binding_adapter_dir(self, binding) -> Path | None:
+        """The PEFT export that holds a sampler binding's weights, if it has one on this head."""
+        if binding.is_adapter:
+            return adapter_dir(self._checkpoint_root, adapter_tag(binding.adapter_path))
+        for state_path in self._model_resource_manager.adapter_state_paths(binding.actor_id):
+            local = self._saved_state_paths.get(state_path) or state_path_to_local(self._checkpoint_root, state_path)
+            candidate = Path(local) / ADAPTER_DIR
+            if (candidate / "adapter_config.json").is_file():
+                return candidate
+        return None
+
+    async def _sample_with_adapter(self, path: Path, req):
+        try:
+            self._checked_adapter_dir(path)
+        except SamplerAdapterError as exc:
+            raise self._sampler_adapter_error(exc) from exc
+        if self._model_resource_manager.rollout_pending:
+            # A lazy rollout starts with any weights: the adapter replaces them for this request.
+            await self._start_lazy_rollout(None)
+        # vLLM loads the adapter from its path on first use and LRU-evicts idle ones.
+        return await tinker_sample(self._get_engine(), req, lora=self._sampler_adapters.spec(path))
+
     def _init_engine(self):
         try:
             self._engine = ColocatedBackend(self.config)
@@ -552,6 +605,14 @@ class TinkerServer:
                 rollout_started=self._engine.rollout_state is RolloutState.READY,
                 rollout_loads_base_weights=self._engine.rollout_loads_base_weights,
             )
+            slots = self._engine.sampler_adapter_slots
+            if slots:
+                self._sampler_adapters = SamplerAdapterIds()
+                logger.info(
+                    "[sampler adapters] %s extra LoRA slot(s), max_lora_rank=%s",
+                    slots,
+                    self._engine.sampler_max_lora_rank,
+                )
             if TeacherInferenceBackend.is_enabled(self.config):
                 self._teacher_backend = TeacherInferenceBackend(self.config)
                 self._model_resource_manager.configure_teacher_models(self._teacher_backend.sampling_targets)
@@ -737,6 +798,12 @@ class TinkerServer:
     async def create_sampling_session(self, req: CreateSamplingSessionRequest):
         self._require_ready()
         try:
+            tag = adapter_tag(req.model_path)
+            if tag is not None:
+                self._checked_adapter_dir(adapter_dir(self._checkpoint_root, tag))
+        except SamplerAdapterError as exc:
+            raise self._sampler_adapter_error(exc) from exc
+        try:
             sampler_id = self._model_resource_manager.sampler_id(req.session_id, req.sampling_session_seq_id)
             self._model_resource_manager.resolve_sampler_target(
                 sampler_id=sampler_id,
@@ -884,7 +951,7 @@ class TinkerServer:
             )
         except UnknownSamplerError as exc:
             raise HTTPException(HTTPStatus.NOT_FOUND, str(exc)) from exc
-        except ModelResourceManagerError as exc:
+        except (ModelResourceManagerError, SamplerAdapterError) as exc:
             raise HTTPException(HTTPStatus.BAD_REQUEST, str(exc)) from exc
 
         scalar_prompt_logprobs = (
@@ -902,6 +969,10 @@ class TinkerServer:
                     scalar_prompt_logprobs=scalar_prompt_logprobs,
                 )
             except StaleSamplerError as exc:
+                # The bound weights left the rollout: serve the checkpoint saved at that
+                # version as an extra LoRA adapter when this head kept its PEFT export.
+                if getattr(self, "_sampler_adapters", None) and self._binding_adapter_dir(binding) is not None:
+                    return SamplingResource.ADAPTER
                 raise HTTPException(HTTPStatus.CONFLICT, str(exc)) from exc
 
         async def _sample_with_late_binding():
@@ -910,6 +981,8 @@ class TinkerServer:
                 await self._start_lazy_rollout(binding)
                 resource = _resolve()
 
+            if resource is SamplingResource.ADAPTER:
+                return await self._sample_with_adapter(self._binding_adapter_dir(binding), req)
             if resource is SamplingResource.TEACHER:
                 if self._teacher_backend is None or binding.teacher_model_path is None:
                     raise RuntimeError("Teacher sampler binding has no initialized teacher backend")

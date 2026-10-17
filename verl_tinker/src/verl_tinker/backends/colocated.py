@@ -51,6 +51,7 @@ from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 
 from ..config_utils import is_no_rollout_deployment, needs_reference_policy
+from ..sampler_adapters import vllm_max_lora_rank
 from ..schemas import ServerCapabilities
 from ._loss import is_ref_in_actor, make_branching_loss
 from .model_lifecycle import ModelLifecycle, ModelRole
@@ -74,6 +75,15 @@ class RolloutStartError(RuntimeError):
     """The rollout replicas failed to start; later sampler requests fail fast with the same error."""
 
     code = ROLLOUT_ENGINE_START_FAILED
+
+
+def _recipe_capabilities() -> dict:
+    """Capabilities the installed recipe reports (``verl_tinker.capabilities``); none without the module."""
+    try:
+        from ..capabilities import runtime_capabilities
+    except ImportError:
+        return {}
+    return dict(runtime_capabilities())
 
 
 def effective_clip_grad(grad_clip_norm: Optional[float]) -> Optional[float]:
@@ -696,6 +706,48 @@ class ColocatedBackend:
         lora_as_adapter = lora_rank > 0 and not lora.get("merge", False)
         return lora_as_adapter and "dummy" not in str(self.config.actor_rollout_ref.rollout.get("load_format", "dummy"))
 
+    # ==================== Sampler adapters (EnvLoop) ====================
+
+    def _lora_rank(self) -> int:
+        model = self.config.actor_rollout_ref.model
+        lora = model.get("lora", None) or {}
+        return int(lora.get("rank", 0) or 0) or int(model.get("lora_rank", 0) or 0)
+
+    def _vllm_engine_kwargs(self) -> dict:
+        engine_kwargs = self.config.actor_rollout_ref.rollout.get("engine_kwargs", None) or {}
+        return dict(engine_kwargs.get("vllm", None) or {})
+
+    @property
+    def sampler_adapter_slots(self) -> int:
+        """Spare vLLM LoRA slots for saved sampler checkpoints (``max_loras`` minus the current weights)."""
+        if self._no_rollout_deployment or self._lora_rank() <= 0:
+            return 0
+        if self.config.actor_rollout_ref.rollout.get("name") != "vllm":
+            return 0
+        return max(int(self._vllm_engine_kwargs().get("max_loras") or 1) - 1, 0)
+
+    @property
+    def sampler_max_lora_rank(self) -> int:
+        configured = int(self._vllm_engine_kwargs().get("max_lora_rank") or 0)
+        return vllm_max_lora_rank(max(self._lora_rank(), configured, 1))
+
+    @property
+    def sampler_unembed_enabled(self) -> bool:
+        """The rollout vLLM serves lm_head LoRA adapters correctly, whatever this session trains: the
+        recipe reports the ``lm_head_lora_prompt_logprobs`` capability (``verl_tinker.capabilities``:
+        vLLM's Qwen3.5 lm_head LoRA and per-token prompt-logprob fixes are installed)."""
+        return _recipe_capabilities().get("lm_head_lora_prompt_logprobs") is True
+
+    @property
+    def sampler_split_qkv_enabled(self) -> bool:
+        """The rollout vLLM loads adapters with separate in_proj_q/k/v LoRAs (``lora_split_qkv``)."""
+        return _recipe_capabilities().get("lora_split_qkv") is True
+
+    def _pin_current_weights(self) -> None:
+        """vLLM may evict LRU adapters; the current weights (pushed as tensors) must stay resident."""
+        if self.sampler_adapter_slots:
+            ray.get([r._server_handle.pin_current_weights.remote() for r in self.rollout_replicas])
+
     # ==================== Worker init ====================
 
     def _build_role_cls(self) -> tuple[dict, Role]:
@@ -874,6 +926,11 @@ class ColocatedBackend:
         num_replicas = world_size // rollout_world_size
 
         replica_class = get_rollout_replica_class(rollout_config.name)
+        if self.sampler_adapter_slots:
+            # Extra per-request LoRA adapters for saved sampler checkpoints (EnvLoop).
+            from .vllm_multi_lora import EnvLoopVLLMReplica
+
+            replica_class = EnvLoopVLLMReplica
 
         self.rollout_replicas = [
             replica_class(
@@ -1110,8 +1167,13 @@ class ColocatedBackend:
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        lora: Optional[dict] = None,
     ) -> TokenOutput:
-        """Dispatch a single generation request to a rollout replica (least-requests)."""
+        """Dispatch a single generation request to a rollout replica (least-requests).
+
+        ``lora`` names a sampler adapter (``lora_name`` / ``lora_int_id`` / ``lora_path``) to decode with instead
+        of the current weights.
+        """
         if self._rollout_state is RolloutState.FAILED:
             raise RolloutStartError(self._rollout_start_error)
         if self._server_manager is None:
@@ -1122,12 +1184,14 @@ class ColocatedBackend:
         if self._is_vexact_rollout():
             sampling_params = self._sanitize_sampling_params_for_vexact(sampling_params)
 
+        extra = {"envloop_lora": lora} if lora is not None else {}
         return await self._server_manager.generate(
             request_id,
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
             video_data=video_data,
+            **extra,
         )
 
     def compute_log_prob(self, data):
@@ -1208,6 +1272,7 @@ class ColocatedBackend:
             logger.info("[engine] offloading actor optimizer before rollout weight sync")
             self.actor_rollout_wg.prepare_actor_for_weight_sync()
         self.checkpoint_manager.update_weights()
+        self._pin_current_weights()
         if self._enable_offload:
             self._move_actor("cpu", reason="after update_weights")
             if self._lifecycle is not None:

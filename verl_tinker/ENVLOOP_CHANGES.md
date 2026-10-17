@@ -621,3 +621,122 @@ Files: new `src/verl_tinker/vllm_backports/` (applier + two diffs), `src/verl_ti
 `tests/gpu/test_envloop_lora_gpu.py`; changed `src/verl_tinker/lora_info.py`,
 `src/verl_tinker/tinker_router.py`, `src/verl_tinker/backends/colocated.py`, `src/verl_tinker/start.py`,
 `pyproject.toml` (package data + one `vllm.general_plugins` entry point; `uv.lock` unchanged), `tests/test_envloop_router_alignment.py`.
+
+
+
+## Saved sampler checkpoints are sampled as extra LoRA adapters (in-session)
+
+Tinker samples any readable sampler checkpoint (`create_sampling_client(model_path=...)`). The
+colocated rollout held one LoRA (VeRL's current-weights adapter, `VLLM_LORA_INT_ID` 123), so a sampler
+checkpoint whose weights had left the rollout failed with 409, and a checkpoint of another session
+could not be sampled at all. Now the rollout vLLM keeps spare LoRA slots and serves such checkpoints
+from their PEFT export beside the current weights; the actor and adapter 123 are never touched.
+
+* `rollout.engine_kwargs.vllm.max_loras` (and `max_cpu_loras`, same value; EnvLoop guest
+  `TINKER_ROLLOUT_MAX_LORAS`, default 3) gives `max_loras - 1` spare slots. VeRL's `launch_server`
+  forces `max_loras=1`; `backends/vllm_multi_lora.py` subclasses `vLLMHttpServer` / `vLLMReplica`
+  to re-apply the configured limits, pin the current-weights adapter after each sync
+  (`pin_lora`) and decode a request with the adapter it names (`generate(..., envloop_lora=...)`,
+  a per-request path-backed `LoRARequest` like SkyRL's vLLM server actor). Optional
+  `max_lora_rank` raises the rollout's rank limit for adapters larger than the session's own rank.
+* Slot management is vLLM's own (`LRUCacheWorkerLoRAManager`): a sampler adapter is loaded from its
+  path on first use and least-recently-used ones are evicted across `max_loras` GPU / `max_cpu_loras`
+  CPU slots, then reloaded on demand; the scheduler never batches more adapters than slots. Adapter
+  123 (tensor-pushed, not reloadable from a path) is pinned so it is never evicted.
+* `sampler_adapters.py`: stable adapter ids (`SamplerAdapterIds`, from 1000), the single head-side
+  compatibility rule (`check_adapter_compatible`: rank <= the rollout's `max_lora_rank`, `lm_head`
+  only if the recipe reports the `lm_head_lora_prompt_logprobs` capability
+  (`verl_tinker.capabilities.runtime_capabilities()`, from the vLLM lm_head LoRA + prompt-logprob
+  backports; absent -> no lm_head adapters), separate linear-attention `in_proj_q/k/v` LoRAs only
+  with the `lora_split_qkv` capability, explicit `target_modules`, no DoRA /
+  `modules_to_save`; vLLM puts LoRA on every supported linear layer, so attention-only / MLP-only
+  adapters always load), checked before a request reaches the engine because a failed adapter load
+  would fail inside the vLLM engine step, and path handling.
+* Binding: `create_sampling_session(model_path="sampler-adapter://<tag>")` binds
+  `<checkpoint_dir>/<tag>/lora_adapter` (the EnvLoop gateway stages an authorised checkpoint's PEFT
+  export there; the tag never leaves the checkpoint root). Missing -> 404
+  `SAMPLER_ADAPTER_NOT_FOUND`, incompatible / no spare slots -> 422 `SAMPLER_ADAPTER_INCOMPATIBLE`.
+* Late binding: an actor-version sampler whose version has left the rollout (an older named sampler
+  of this session) now falls back to the training-state checkpoint saved at that version if its
+  `lora_adapter/` export exists (written by the EnvLoop guest before publishing); otherwise 409 as
+  before.
+* Adapter samples take prompt logprobs from the rollout with the adapter (never the actor); the
+  scalar pass for `prompt_logprobs` + `topk_prompt_logprobs` also runs with the adapter.
+
+Reused from SkyRL (Apache-2.0, NovaSky-AI/SkyRL): `skyrl/tinker/extra/external_inference.py`
+(adapter unpacked into a local directory and referenced by name) and
+`skyrl/backends/skyrl_train/inference_servers/vllm_server_actor.py` (`add_lora` with a name ->
+`lora_int_id` map, the `LoRARequest` resolved per generate request).
+
+Files: `src/verl_tinker/sampler_adapters.py`, `src/verl_tinker/backends/vllm_multi_lora.py` (new),
+`src/verl_tinker/backends/colocated.py`, `src/verl_tinker/model_resource_manager.py`,
+`src/verl_tinker/tinker_router.py`, `src/verl_tinker/tinker_ops.py`, `tests/test_sampler_adapters.py`,
+`tests/gpu/test_sampler_adapters_gpu.py`.
+
+Validation: CPU `tests/test_sampler_adapters.py` (adapter ids, current-weights pinning, compatibility, path
+containment, engine-arg re-application, per-task LoRA override, router binding + late fallback with
+training weights untouched, rollout-only prompt logprobs). GPU
+`tests/gpu/test_sampler_adapters_gpu.py`, 2026-10-17, 1x A100-SXM4-80GB (Verda, driver 580.178,
+vLLM 0.26.0 / torch 2.11.0+cu130 from `uv.lock`), Qwen/Qwen3.5-4B LoRA rank 16 through EnvLoop's
+`trainingmaster-actor-rollout.yaml` + production env (FSDP2, rollout TP 1 / 0.4, `max_loras` 3):
+passed. Rollout prompt logprobs over 21 positions: training moved them by max 19.4 / mean 8.3 nats;
+sampler A served later from its PEFT export vs at save time: max 0.0625 / mean 0.003 (seeded
+16-token sample identical, logprobs within 3e-6), within the rollout's own repeat noise for one set
+of weights (max 0.068 / mean 0.015) and below the actor-vs-rollout gap at save time (0.34); the
+staged copy (`sampler-adapter://<tag>`) gave identical values; concurrent mixed requests
+max 0.20 (batch-composition noise); LRU with 3 adapters on 2 spare slots reloads correctly; the
+current-weights sampler and the actor were bit-identical before and after adapter sampling, and
+training continued.
+
+Recheck after rebasing onto `envloop/main` dad7650 (same A100 setup, 2026-10-17): sampler-adapter GPU
+test passed (A later vs at save max 0.078 / mean 0.012, staged copy within 1e-6, concurrent
+requests max 0.25 / mean <= 0.05 per request against a 7.0 mean training move, LRU within 1e-6,
+current sampler and actor bit-identical); `test_envloop_alignment_gpu.py` 11/11. The concurrent check
+now bounds each request's max deviation and its mean against the training move, since vLLM's batched
+LoRA numerics are not batch-invariant (an earlier rerun had a 0.05+ mean in a mixed batch).
+
+Rework (2026-10-17): the recipe-side LRU registry (explicit `add_lora` / `remove_lora`, in-flight
+counts, 429 when busy) was removed in favour of vLLM's native LoRA LRU (`max_loras` /
+`max_cpu_loras`, on-demand loading from a path-backed `LoRARequest`) plus `pin_lora` for the
+current weights. Searched: vLLM 0.26 docs (Context7 `/vllm-project/vllm/v0.26.0`: LoRA, resolver
+plugins) and source (`vllm/lora/worker_manager.py`, `model_manager.py`, `utils/cache.py`), VeRL
+`cfacd76a` rollout (`max_loras` hard-coded to 1, single adapter id 123, no multi-adapter API).
+Still custom, because no framework capability covers it: re-applying `max_loras` over VeRL's
+override and a per-request LoRA in VeRL's `generate` (VeRL always decodes with 123); the vLLM
+`lora_filesystem_resolver` plugin resolves adapter names in the OpenAI server layer, which VeRL's
+token-in/token-out `engine.generate` path does not use.
+GPU recheck of the rework (1x A100 80GB, Verda, same setup): passed. A served later vs at save max
+0.15 / mean 0.03 and the staged copy identical, against a training move of max 33 / mean 6.4; LRU
+with 3 adapters on 2 spare slots within 1.4e-3 after vLLM's own eviction and reload; the pinned
+current-weights sampler before/after adapter use 0.128 max, equal to its repeat noise floor (0.128),
+i.e. never evicted; actor bit-identical.
+
+Concurrent-request check (replaces two earlier ad-hoc relaxations): the test runs the same mixed
+batch (A, current weights, staged copy, x2) twice to measure this hardware's batching noise floor
+(max_n, mean_n), then requires every mixed-vs-solo comparison to stay within max(3 x max_n, 0.5) /
+max(3 x mean_n, 0.1), and separately the mean to stay below 5% of the wrong-adapter mean
+(|current - A|). Run 2026-10-17 on 1x A100 80GB (Verda, ~$0.6, destroyed): noise floor max 0.124 /
+mean 0.0285 -> tolerance 0.5 / 0.1; mixed vs solo at most 0.124 / 0.028 over 12 requests;
+wrong-adapter mean 7.07; LRU reload 0.115; current sampler before/after 0.0235; passed.
+
+### Raising the rollout's `max_lora_rank` for sampler adapters (measured, not default)
+
+`rollout.engine_kwargs.vllm.max_lora_rank` lets the rollout accept sampler adapters above the
+session's own rank bucket. Measured 2026-10-17, 1x A100 80GB (Verda), Qwen3.5-4B, session LoRA
+rank 8, rollout TP 1 / 0.4; 3 syncs + 32x256-token sampling per config (median tok/s):
+
+| config | peak GPU MiB | sampling tok/s | sync s |
+|---|---|---|---|
+| max_loras 1, rank 8 (before this PR), 2 runs | 45511 / 43355 | 1994 / 1944 | 3.73 / 3.82 |
+| max_loras 3, rank 8 (this PR's default) | 43363 | 2007 | 3.76 |
+| max_loras 3, max_lora_rank 32 | 43377 | 1915 | 3.78 |
+| max_loras 3, max_lora_rank 64 | 41983 | 1825 | 3.88 |
+| max_loras 3, max_lora_rank 128, 2 runs | 43369 / 41971 | 1714 / 1712 | 3.85 / 3.89 |
+
+Peak memory does not change (the rollout reserves a fixed `gpu_memory_utilization`; LoRA buffers,
+computed 1.45 GiB at 3 x 128 for 4B, come out of its KV cache). Sampling throughput does: vLLM's
+LoRA kernels run at `max_lora_rank` for every request, current weights included, so 128 costs
+~15% (64: ~9%, 32: ~4.6%); the rank-8 sync is ~2-3% slower. Left unset by default.
+Estimate for Qwen3.8-27B (64 layers, 3:1 linear/full attention, TP 2), LoRA buffers =
+max_loras x rank x sum(in+out) x 2 bytes: 3 x 64 -> 2.6 GiB total (~1.3-2 GiB per GPU), 3 x 128
+-> 5.2 GiB (~2.6-4 GiB per GPU), plus lm_head 0.09 / 0.18 GiB if wrapped.
