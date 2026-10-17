@@ -638,16 +638,11 @@ async def sample(engine, req) -> dict:
         else:
             prompt_logprobs_out = _scalar_prompt_logprobs(prompt_lp_raw, len(prompt_ids))
     if req.prompt_logprobs and req.topk_prompt_logprobs:
-        # Tinker returns both fields when both are requested. The top-k rows need
-        # not contain the actual prompt token, so score it in one scalar pass.
-        scalar_params = {k: v for k, v in sampling_params.items() if k not in {"stop", "stop_token_ids"}}
-        scalar_params.update(max_tokens=1, prompt_logprobs=0)
-        scalar = await engine.generate(
-            request_id=uuid.uuid4().hex, prompt_ids=prompt_ids, sampling_params=scalar_params
-        )
-        scalar_raw = (getattr(scalar, "extra_fields", None) or {}).get("prompt_logprobs")
-        if scalar_raw is not None:
-            prompt_logprobs_out = _scalar_prompt_logprobs(scalar_raw, len(prompt_ids))
+        # Tinker serves prompt logprobs and compute_logprobs from one engine. Here
+        # compute_logprobs runs on the actor (sample_prompt_logprobs), so score the
+        # prompt there too: the two stay identical even when the sampler's tensor
+        # parallel numerics differ from the actor's (Qwen3.8-27B, TP 2).
+        prompt_logprobs_out = (await sample_prompt_logprobs(engine, req, reference=False))["prompt_logprobs"]
 
     return {
         "type": "sample",

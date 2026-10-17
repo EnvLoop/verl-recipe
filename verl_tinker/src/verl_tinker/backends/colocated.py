@@ -73,6 +73,46 @@ def effective_clip_grad(grad_clip_norm: Optional[float]) -> Optional[float]:
     return value if value > 0 else float("inf")
 
 
+def _on_sender_device(weight):
+    """``weight`` on the current accelerator; host tensors are copied there."""
+    if getattr(getattr(weight, "device", None), "type", None) != "cpu":
+        return weight
+    from verl.utils.device import get_device_id, get_device_name
+
+    return weight.to(f"{get_device_name()}:{get_device_id()}")
+
+
+def _patch_large_weight_ipc_device() -> None:
+    """Send CPU-resident oversized weights from the current device.
+
+    VeRL streams rollout weights through a fixed-size device bucket, but a
+    weight larger than the bucket is shared directly with
+    ``reduce_tensor(weight)``. With an FSDP1 actor the gathered full weights are
+    CPU tensors, so that handle is a CPU-storage handle without a device slot and
+    the vLLM receiver fails in ``rebuild_ipc`` (``list_args[6] = device_id``:
+    IndexError). Qwen3.8-27B's ~2.5 GB embedding exceeds the default 2 GB bucket.
+    Copy such a weight to the sender's device first; the copy lives until the
+    receiver acknowledges the transfer. Runs at import, i.e. in every Ray worker
+    that loads this module's worker classes.
+    """
+    try:
+        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
+    except Exception:  # noqa: BLE001 - a VeRL without bucketed transfer has nothing to patch
+        return
+    original = BucketedWeightSender._direct_send_large_weight
+    if getattr(original, "_envloop_device_patch", False):
+        return
+
+    def _direct_send_large_weight(self, name, weight):
+        return original(self, name, _on_sender_device(weight))
+
+    _direct_send_large_weight._envloop_device_patch = True
+    BucketedWeightSender._direct_send_large_weight = _direct_send_large_weight
+
+
+_patch_large_weight_ipc_device()
+
+
 class TinkerServerActorRolloutRefWorker(TinkerActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to_actor(self, device, model=True, optimizer=True, grad=True):

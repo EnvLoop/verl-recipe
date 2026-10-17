@@ -263,3 +263,20 @@ silently carried over (found by the EnvLoop prod e2e: steps after a weights-only
 resume differed by 2.6e-3 instead of ~0.1 on Tinker). The backend now calls the new worker method
 `reset_optimizer_state`, which clears the torch optimizer's per-parameter state and gradients, so the next
 step is a first step from the saved weights. `optimizer=true` is unchanged.
+
+## Oversized weights are sent from the device (Qwen3.8-27B rollout sync)
+
+VeRL's bucketed rollout weight transfer shares any weight larger than the 2 GB bucket directly with
+`reduce_tensor(weight)`. With an FSDP1 actor the gathered full weights are CPU tensors, so the handle is a
+CPU-storage handle and the vLLM receiver fails in `rebuild_ipc` (`list_args[6] = device_id`: IndexError),
+killing the session at the first `save_weights_for_sampler` (EnvLoop prod e2e, Qwen3.8-27B, 2× GPU,
+FSDP1, TP 2: the ~2.5 GB embedding exceeds the bucket; Qwen3.5-4B never takes this path). The backend
+module now patches `BucketedWeightSender._direct_send_large_weight` at import (in every Ray worker that
+loads the worker classes) to copy host tensors to the sender's device first.
+
+## Combined prompt logprobs are scored on the actor (same as compute_logprobs)
+
+With `include_prompt_logprobs` and `topk_prompt_logprobs` both set, the scalar `prompt_logprobs` now come from
+`sample_prompt_logprobs` (the actor forward that also serves `compute_logprobs`), while the top-k rows still
+come from the sampler. Tinker serves both from one engine; on Qwen3.8-27B the TP-2 sampler differed from the
+actor by up to 0.118 nats on single prompt tokens (mean 0.005), so the two APIs disagreed.
