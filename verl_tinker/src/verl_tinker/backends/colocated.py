@@ -405,8 +405,14 @@ class ColocatedBackend:
 
     @property
     def rollout_loads_base_weights(self) -> bool:
-        """vLLM reads the base weights from disk at start; ``dummy`` needs a sync from the actor first."""
-        return "dummy" not in str(self.config.actor_rollout_ref.rollout.get("load_format", "dummy"))
+        """A started rollout holds the base model before any sync: vLLM read it from disk (not ``dummy``)
+        and the warm-up sleep kept it, which VeRL does only for LoRA adapters (sleep level 1; full weights
+        sleep at level 2 and are discarded)."""
+        model = self.config.actor_rollout_ref.model
+        lora = model.get("lora", None) or {}
+        lora_rank = int(lora.get("rank", 0) or 0) or int(model.get("lora_rank", 0) or 0)
+        lora_as_adapter = lora_rank > 0 and not lora.get("merge", False)
+        return lora_as_adapter and "dummy" not in str(self.config.actor_rollout_ref.rollout.get("load_format", "dummy"))
 
     # ==================== Worker init ====================
 

@@ -1043,6 +1043,7 @@ def test_recently_retrieved_results_are_bounded(monkeypatch):
         server._remember_retrieved(request_id, {"type": request_id})
     assert list(server._recently_retrieved) == ["b", "c"]
 
+
 # ==================== Lazy rollout start (EnvLoop) ====================
 
 

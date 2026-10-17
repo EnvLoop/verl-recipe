@@ -1236,6 +1236,18 @@ def test_training_never_starts_a_lazy_rollout():
     assert backend.rollout_state is RolloutState.NOT_STARTED
 
 
-@pytest.mark.parametrize(("load_format", "expected"), [("dummy", False), ("safetensors", True), ("auto", True)])
-def test_rollout_loads_base_weights_unless_dummy(load_format, expected):
-    assert _lazy_backend(load_format).rollout_loads_base_weights is expected
+@pytest.mark.parametrize(
+    ("load_format", "lora", "expected"),
+    [
+        ("dummy", {"lora_rank": 8}, False),
+        ("safetensors", {"lora_rank": 8}, True),
+        ("auto", {"lora": {"rank": 8}}, True),
+        # Full weights (or merged LoRA) sleep at level 2, which discards what vLLM loaded.
+        ("safetensors", {}, False),
+        ("safetensors", {"lora": {"rank": 8, "merge": True}}, False),
+    ],
+)
+def test_rollout_loads_base_weights_only_when_vllm_keeps_them(load_format, lora, expected):
+    backend = _lazy_backend(load_format)
+    backend.config.actor_rollout_ref.model.update(lora)
+    assert backend.rollout_loads_base_weights is expected
