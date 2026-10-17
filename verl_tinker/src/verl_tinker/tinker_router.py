@@ -17,7 +17,7 @@
 import asyncio
 import logging
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -93,6 +93,8 @@ app = FastAPI(title="VeRL Tinker Server", version="0.1.0")
 # create_training_client_from_state asserts LoRA metadata before load_state.
 TINKER_COOKBOOK_COMPAT_LORA_RANK = 1
 MAX_REQUEST_STATUS_ENTRIES = 100_000
+# Retrieved results kept for a repeated retrieve_future (the client retries when a response is lost).
+MAX_RECENTLY_RETRIEVED_RESULTS = 1024
 # vLLM's default ``max_logprobs``; override with ``server.max_topk_logprobs``.
 DEFAULT_MAX_TOPK_LOGPROBS = 20
 
@@ -562,6 +564,13 @@ class TinkerServer:
 
         self._pending[request_id] = asyncio.create_task(_run())
 
+    def _remember_retrieved(self, request_id: str, response: dict[str, Any]) -> dict[str, Any]:
+        recent = self.__dict__.setdefault("_recently_retrieved", OrderedDict())
+        recent[request_id] = response
+        while len(recent) > MAX_RECENTLY_RETRIEVED_RESULTS:
+            recent.popitem(last=False)
+        return response
+
     def _compact_request_status_if_needed(self) -> None:
         if len(self._request_status) < MAX_REQUEST_STATUS_ENTRIES:
             return
@@ -875,12 +884,19 @@ class TinkerServer:
         if request_id in self._futures:
             payload = self._futures.pop(request_id)
             self._request_status[request_id] = RequestStatus.RETRIEVED
-            return payload
+            return self._remember_retrieved(request_id, payload)
 
         if request_id in self._errors:
             error = self._errors.pop(request_id)
             self._request_status[request_id] = RequestStatus.RETRIEVED
-            return {"error": error, "category": "Application"}
+            return self._remember_retrieved(request_id, {"error": error, "category": "Application"})
+
+        recent = self.__dict__.get("_recently_retrieved")
+        if recent is not None and request_id in recent:
+            # The client retries a retrieve whose response it never received (e.g. a dropped
+            # connection through the gateway); answer it again instead of failing the future.
+            recent.move_to_end(request_id)
+            return recent[request_id]
 
         if request_id in self._request_status or request_id in self._retrieved_request_status_archive:
             logger.warning(

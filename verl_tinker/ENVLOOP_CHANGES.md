@@ -298,3 +298,11 @@ weights (`ModelResourceManager.resolve_resource` returns `ROLLOUT`), so the two 
 engines: EnvLoop prod e2e Qwen3.5-4B max abs diff 0.084 (was exactly 0.0 with the sampler pass), and the
 recipe GPU suite failed on A100. The scalar pass is back on the sampler. The 0.118 gap first seen on
 Qwen3.8-27B (2× B200, TP 2) is between two sampler passes and is tracked separately.
+
+## retrieve_future answers a repeated retrieve
+
+`retrieve_future` popped a finished result on the first read, so when that response was lost on the way
+back (EnvLoop prod 2026-10-17: a Qwen3.8-27B `forward_backward` after `load_state_with_optimizer`, through
+the EnvLoop gateway) the SDK's retry got "future id result already retrieved" and the training call
+failed. The router now keeps the last 1024 retrieved results and errors and returns them again on a
+repeated retrieve; older ids still report that they were seen.

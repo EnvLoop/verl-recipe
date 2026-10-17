@@ -784,6 +784,8 @@ async def test_retrieve_unknown_future_reports_whether_it_was_seen_before():
     assert await server.retrieve_future(SimpleNamespace(request_id="seen")) == {"type": "done"}
     assert server._request_status["seen"] is RequestStatus.RETRIEVED
 
+    # Results older than the recently-retrieved window report that they were seen.
+    server._recently_retrieved.clear()
     seen_again = await server.retrieve_future(SimpleNamespace(request_id="seen"))
     never_seen = await server.retrieve_future(SimpleNamespace(request_id="never-seen"))
 
@@ -1011,3 +1013,29 @@ async def test_gate_limits_concurrent_samples():
     assert events[:2] == ["start:0", "start:1"]
     assert "start:2" in events[2:]
     assert sorted(events) == ["end:0", "end:1", "end:2", "start:0", "start:1", "start:2"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_retrieve_returns_the_same_result_or_error():
+    # The SDK retries a retrieve whose response was lost in transit; it must get the result again.
+    server = object.__new__(_router_class())
+    _init_future_tracking(server)
+    server._futures = {"done": {"type": "forward_backward", "loss": 1.5}}
+    server._errors = {"failed": "RuntimeError('boom')"}
+    server._request_status = {"done": RequestStatus.COMPLETED, "failed": RequestStatus.ERROR}
+
+    for _ in range(3):
+        assert await server.retrieve_future(SimpleNamespace(request_id="done")) == {
+            "type": "forward_backward", "loss": 1.5}
+        assert await server.retrieve_future(SimpleNamespace(request_id="failed")) == {
+            "error": "RuntimeError('boom')", "category": "Application"}
+    assert server._futures == {} and server._errors == {}
+
+
+def test_recently_retrieved_results_are_bounded(monkeypatch):
+    server = object.__new__(_router_class())
+    _init_future_tracking(server)
+    monkeypatch.setitem(server._remember_retrieved.__globals__, "MAX_RECENTLY_RETRIEVED_RESULTS", 2)
+    for request_id in ("a", "b", "c"):
+        server._remember_retrieved(request_id, {"type": request_id})
+    assert list(server._recently_retrieved) == ["b", "c"]
