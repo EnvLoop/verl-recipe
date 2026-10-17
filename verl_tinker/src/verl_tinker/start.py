@@ -149,9 +149,11 @@ def main() -> None:
         raise SystemExit(USAGE)
 
     # Before any vLLM process starts: the rollout needs upstream vLLM fixes (vllm_backports).
+    from .capabilities import assert_startup_capabilities
     from .vllm_backports import apply_installed
 
     apply_installed()
+    assert_startup_capabilities()
 
     config = load_config(sys.argv[2])
 

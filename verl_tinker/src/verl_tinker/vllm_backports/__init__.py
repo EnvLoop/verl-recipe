@@ -91,12 +91,41 @@ def apply(root: pathlib.Path, version: str, fixes=FIXES) -> list[str]:
     return changed
 
 
-def apply_installed() -> list[str]:
-    """Patch the installed vLLM before any vLLM worker process imports it (no-op without vLLM)."""
+def _installed_root_and_version():
     spec = importlib.util.find_spec("vllm")
     if spec is None or spec.origin is None:
+        return None, None
+    return pathlib.Path(spec.origin).parent, re.sub(r"\+.*$", "", importlib.metadata.version("vllm"))
+
+
+def present(root: pathlib.Path, version: str, fixes=FIXES) -> bool:
+    """Every fix is in the vLLM tree: its backport is applied, or the release ships it (no diff)."""
+    for fix in fixes:
+        diff = PATCHES / f"{fix}-{version}.diff"
+        if not diff.exists():
+            continue
+        for relative, file_hunks in hunks(diff.read_text()).items():
+            source = (root.parent / relative).read_text()
+            if any(source.count(new) != 1 for _, new in file_hunks):
+                return False
+    return True
+
+
+def find_installed() -> bool:
+    return _installed_root_and_version()[0] is not None
+
+
+def present_installed() -> bool:
+    """``present`` for the installed vLLM (False without vLLM). Reads files only; works in any process."""
+    root, version = _installed_root_and_version()
+    return root is not None and present(root, version)
+
+
+def apply_installed() -> list[str]:
+    """Patch the installed vLLM before any vLLM worker process imports it (no-op without vLLM)."""
+    root, version = _installed_root_and_version()
+    if root is None:
         return []
-    version = re.sub(r"\+.*$", "", importlib.metadata.version("vllm"))
-    changed = apply(pathlib.Path(spec.origin).parent, version)
+    changed = apply(root, version)
     logger.info("vLLM %s backports applied: %s", version, ", ".join(changed) or "(already applied)")
     return changed

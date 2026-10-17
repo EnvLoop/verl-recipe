@@ -476,6 +476,12 @@ end to end (EnvPlatform: `lora_targets.py`, guest overlay; this repo: the pieces
   `lm_head` delta per request instead of per token, so `compute_logprobs` missed a request's own
   `lm_head` adapter and other requests' adapters leaked in). Both are rebased onto vLLM 0.26.0;
   a release that already contains a fix simply has no diff for it.
+* **Capability declaration.** `verl_tinker.capabilities.LM_HEAD_LORA_PROMPT_LOGPROBS = True` declares that
+  this recipe ships both backports. `verl_tinker.start` asserts after applying them that the installed
+  vLLM really contains both (otherwise the server does not start), and the head reports the verified
+  value as `capabilities: {"lm_head_lora_prompt_logprobs": bool}` in `get_info` and
+  `get_server_capabilities` (re-checked from the installed files, so it holds in every process).
+  EnvLoop's gateway uses it to decide whether a head may sample adapters with an `lm_head` LoRA.
 * Non-power-of-two ranks work in the backend (vLLM zero-pads the adapter into
   `max_lora_rank`, the next value of `MaxLoRARanks`); EnvLoop still only accepts Tinker's
   powers of two.

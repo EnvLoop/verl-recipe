@@ -41,6 +41,7 @@ from tinker.types import (
 
 from .backends.colocated import ColocatedBackend, RolloutState
 from .backends.teacher import TeacherInferenceBackend
+from .capabilities import runtime_capabilities
 from .lora_info import LoraInfo, configured_lora_info
 from .model_resource_manager import (
     LazyRolloutPlan,
@@ -658,7 +659,10 @@ class TinkerServer:
 
     @app.api_route("/api/v1/get_server_capabilities", methods=["GET", "POST"])
     async def get_server_capabilities(self):
-        return get_supported_models(self._get_engine(), getattr(self, "_teacher_backend", None))
+        return {
+            **get_supported_models(self._get_engine(), getattr(self, "_teacher_backend", None)),
+            "capabilities": runtime_capabilities(),
+        }
 
     @app.post("/api/v1/client/config")
     async def client_config(self):
@@ -683,6 +687,7 @@ class TinkerServer:
             "model_data": {"arch": None, "model_name": model_name, "tokenizer_id": model_name},
             "model_id": req.model_id,
             "optimizer_config": {"type": "adamw"},
+            "capabilities": runtime_capabilities(),
             **lora,
             "model_name": model_name,
         }

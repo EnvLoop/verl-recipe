@@ -23,7 +23,7 @@ import torch
 from fastapi import HTTPException
 from omegaconf import OmegaConf
 from test_envloop_router_alignment import _server
-from verl_tinker import vllm_backports
+from verl_tinker import capabilities, vllm_backports
 from verl_tinker.backends.colocated import lora_init_seed
 from verl_tinker.lora_info import configured_lora_info
 
@@ -249,3 +249,26 @@ def test_qwen3_5_backport_declares_lm_head_lora():
     [(path, [(old, new)])] = vllm_backports.hunks(diff).items()
     assert path == "vllm/model_executor/models/qwen3_5.py"
     assert '"lm_head": "output_embeddings"' in new and "embedding_modules" not in old
+
+
+def test_capability_reports_only_verified_backports(tmp_path, monkeypatch):
+    root = tmp_path / "vllm"
+    for fix in vllm_backports.FIXES:
+        for relative, file_hunks in vllm_backports.hunks(
+            (vllm_backports.PATCHES / f"{fix}-0.26.0.diff").read_text()
+        ).items():
+            target = root.parent / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("a") as handle:
+                handle.write("".join(f"{old}# --\n" for old, _ in file_hunks))
+    assert vllm_backports.present(root, "0.26.0") is False
+    monkeypatch.setattr(vllm_backports, "_installed_root_and_version", lambda: (root, "0.26.0"))
+    with pytest.raises(vllm_backports.BackportError):
+        capabilities.assert_startup_capabilities()
+    assert capabilities.runtime_capabilities() == {"lm_head_lora_prompt_logprobs": False}
+
+    vllm_backports.apply_installed()
+    capabilities.assert_startup_capabilities()
+    assert capabilities.runtime_capabilities() == {"lm_head_lora_prompt_logprobs": True}
+    assert vllm_backports.present(root, "9.9.9")  # a release without diffs ships the fixes
+    capabilities.runtime_capabilities.cache_clear()
