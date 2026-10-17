@@ -512,6 +512,21 @@ EnvLoop guest: EnvPlatform `trainingmaster-actor-rollout.yaml` + `recipe_server.
   settings; the H200 rows on VeRL's own collector (before `_layered_lora_params`, i.e. its
   host-memory fallback), the H100 row on `_layered_lora_params`.
 
+Fused log-prob kernels and the backports (2026-10-17, 1x H100, this branch on top of the
+long-context branch's `verl_patches`; guest overlay + `use_remove_padding`, `use_fused_kernels`
+(torch backend), `external_lib: verl_tinker.verl_patches`):
+
+| adapter | training loss (sum over 10 targets) | sampler vs actor after training | rollout prompt logprobs vs actor |
+|---|---|---|---|
+| Qwen3.5-4B, rank 8, lm_head only, 12 steps | 116.7 -> 44.3 (only the lm_head LoRA trains, so the fused path uses it) | 0.0015 mean | 0.042 mean (max 0.106) |
+| Qwen3.5-4B, rank 32, all layers, seed 5 (same init digest as before) | 116.7 -> 0.04 | 0.030 mean | 0.043 mean |
+
+Mixed batch on the rollout's vLLM 0.26 with both backports (offline `LLM`, `max_loras=2`): the
+base model, the lm_head-only adapter and the all-layers adapter scored together vs alone: base
+identical (0.0), adapters 0.047 / 0.033 mean (0.14 max), the same as batching one adapter with
+itself (0.026 mean, 0.17 max), i.e. bf16 batch noise, no cross-adapter leak (unpatched vLLM leaks
+up to 15 nats). Prompt logprobs of either adapter alone vs the actor: 0.046 / 0.048 mean.
+
 Correction: an earlier draft said vLLM 0.31 ignores a Qwen3.5 `lm_head` LoRA. It applies it when
 generating; what differed was prompt logprobs, i.e. the #62049 bug above (found by the EnvLoop
 sampling-pool work). The pool applies the same backport; serving endpoints keep rejecting `lm_head`
