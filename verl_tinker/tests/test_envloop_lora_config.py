@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tinker LoraConfig parity on CPU: explicit target modules, seed, reporting, vLLM lm_head plugin."""
+"""Tinker LoraConfig parity on CPU: explicit target modules, seed, reporting, vLLM backports."""
 
 import re
 from http import HTTPStatus
