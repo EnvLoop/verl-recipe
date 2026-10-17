@@ -500,23 +500,21 @@ EnvLoop guest: EnvPlatform `trainingmaster-actor-rollout.yaml` + `recipe_server.
 | | 8, unembed only, **without #48850** | same | **1.98** (0% trained tokens sampled: lm_head LoRA dropped) | 42,273 |
 | | 128, all | 275,906,560 = 128 x 2,155,520 | 0.030 | 42,823 |
 | | 256, all (not offered: Tinker max 128) | 551,813,120 | 0.067 (training diverged at lr 1e-3) | 44,309 |
-| Qwen3.8-27B, 2x H200, FSDP1, TP2 / 0.5, layered sync | 8, unembed only | 2,027,520 = 8 x 253,440 | 0.0024 (100% trained tokens) | n/a |
+| Qwen3.8-27B, 2x H200, FSDP1, TP2 / 0.5, layered sync (not the prod path) | 8, unembed only | 2,027,520 = 8 x 253,440 | 0.0024 (100% trained tokens) | n/a |
 | | 128, all (seed 5) | 902,758,400 = 128 x 7,052,800 | 0.0126 | 101,595 / GPU |
-| Qwen3.8-27B, 2x H100 80GB, same, **on this branch rebased on `_layered_lora_params`** | 128, all (seed 5) | 902,758,400 | 0.025 (before training 0.027) | 75,999 / GPU |
+| Qwen3.8-27B, 2x H100 80GB, same (not the prod path) | 128, all (seed 5) | 902,758,400 | 0.025 (before training 0.027) | 75,999 / GPU |
 
 * Every exported adapter has exactly the expected `target_modules`, `r`, `lora_alpha: 32` and no
   vision-tower tensors; `get_info` reports them and `create_model` with other flags is a 409.
 * Seed: the initial adapter digest for seed 5 is identical across server runs and machines
   (4B: three runs on H100 and H200; 27B: H100 and H200).
 * A 4,000-token `forward_backward` + `optim_step` runs at every rank (4B ~1 s, 27B 4.4 s at rank 128).
-* Qwen3.8-27B: with the default full-model weight sync (`layered_summon: false`,
-  `load_format: dummy`) the first `save_weights_for_sampler` OOMs on 2x H100 **and** 2x H200 (FSDP1
-  `summon_full_params` of the whole model while the sleeping vLLM worker keeps ~30 GiB; reproduced
-  with the legacy `all-linear` adapter and without #48850, and in the EnvLoop prod e2e). This is
-  what "LoRA rollout sync gathers one FSDP unit at a time" above fixes (EnvPlatform's 27B profile
-  sets `layered_summon: true` + `load_format: safetensors`). The 27B rows above ran with those two
-  settings; the H200 rows on VeRL's own collector (before `_layered_lora_params`, i.e. its
-  host-memory fallback), the H100 row on `_layered_lora_params`.
+* The Qwen3.8-27B rows were measured on an FSDP1 actor with `layered_summon: true` +
+  `load_format: safetensors` (the only setting under which an FSDP1 27B rollout sync fitted on these
+  hosts at the time). That is **not** EnvLoop's production 27B path (FSDP2, layered sync off, dummy
+  load format; see the long-context and 27B profile changes), so the rows show adapter layout,
+  parameter counts and that the TP-2 rollout applies the `lm_head` LoRA, not production memory.
+  27B has not been re-validated on the production path for this change.
 
 Fused log-prob kernels and the backports (2026-10-17, 1x H100, this branch on top of the
 long-context branch's `verl_patches`; guest overlay + `use_remove_padding`, `use_fused_kernels`
