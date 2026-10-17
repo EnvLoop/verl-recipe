@@ -53,6 +53,12 @@ The tracked concepts are:
   decoding requires the matching rollout.  Scalar prompt-logprob requests may
   instead use the matching actor, or the reference policy for initial version
   zero.  Teacher bindings always use their configured teacher backend.
+* Lazy rollout (EnvLoop, ``server.rollout_start: lazy``): until the rollout is
+  started it holds no weights (``rollout_id`` is ``None``) and scalar
+  prompt-logprob requests prefer the actor.  A request that needs the rollout
+  starts it with ``lazy_rollout_plan``: vLLM's own base weights serve version
+  zero when it loads them from disk; otherwise the start pushes the actor's
+  current version.
 
 Optimizer, gradient, and broader training-state equivalence are deliberately not
 modeled.  In particular, actor-version equality means only that the tracked model
@@ -81,6 +87,13 @@ class UnknownSamplerPathError(ModelResourceManagerError):
 
 class StaleSamplerError(ModelResourceManagerError):
     """Raised when no configured resource contains the requested weights."""
+
+
+class LazyRolloutPlan(str, Enum):
+    """How a rollout that has not started yet comes to hold the requested weights."""
+
+    BASE = "base"  # vLLM loads the base model (actor version zero) itself
+    SYNC = "sync"  # start, then push the actor's current weights
 
 
 class SamplingResource(str, Enum):
@@ -132,6 +145,8 @@ class ModelResourceManager:
         self.rollout_id: int | None = 0
         self._next_actor_id = 1
         self._rollout_enabled = True
+        self._rollout_started = True
+        self._rollout_loads_base_weights = True
         self._reference_enabled = False
 
         self._state_path_to_actor_id: dict[str, int] = {}
@@ -178,12 +193,52 @@ class ModelResourceManager:
         self._require_session(session_id)
         return list(self._session_model_ids[session_id])
 
-    def configure_resources(self, *, rollout_enabled: bool, reference_enabled: bool) -> None:
-        """Record which late-bound inference resources exist on this server."""
+    def configure_resources(
+        self,
+        *,
+        rollout_enabled: bool,
+        reference_enabled: bool,
+        rollout_started: bool = True,
+        rollout_loads_base_weights: bool = True,
+    ) -> None:
+        """Record which late-bound inference resources exist on this server.
+
+        ``rollout_started=False`` declares a lazy rollout; ``rollout_loads_base_weights``
+        says whether, once started, it holds the base model before any weight sync.
+        """
         self._rollout_enabled = bool(rollout_enabled)
         self._reference_enabled = bool(reference_enabled)
-        if not self._rollout_enabled:
+        self._rollout_started = self._rollout_enabled and bool(rollout_started)
+        self._rollout_loads_base_weights = bool(rollout_loads_base_weights)
+        if not self._rollout_started:
             self.rollout_id = None
+
+    @property
+    def rollout_pending(self) -> bool:
+        """The rollout exists on this server but has not been started yet."""
+        return self._rollout_enabled and not self._rollout_started
+
+    def lazy_rollout_plan(self, binding: SamplerBinding | None = None) -> LazyRolloutPlan | None:
+        """How starting the pending rollout would serve ``binding`` (any weights when ``None``), or ``None``."""
+        if not self.rollout_pending:
+            return None
+        if binding is None:
+            return LazyRolloutPlan.BASE if self._rollout_loads_base_weights else LazyRolloutPlan.SYNC
+        if binding.is_teacher or binding.actor_id is None:
+            return None
+        if binding.actor_id == 0 and self._rollout_loads_base_weights:
+            return LazyRolloutPlan.BASE
+        if binding.actor_id == self.actor_id:
+            return LazyRolloutPlan.SYNC
+        return None
+
+    def rollout_started(self, plan: LazyRolloutPlan) -> int | None:
+        """Record a lazy start executed with ``plan``; returns the new ``rollout_id``."""
+        if not self._rollout_enabled:
+            raise ModelResourceManagerError("Cannot start a rollout when rollout is disabled")
+        self._rollout_started = True
+        self.rollout_id = self.actor_id if plan is LazyRolloutPlan.SYNC else 0
+        return self.rollout_id
 
     def configure_teacher_models(self, teacher_models: Iterable[tuple[str, str]]) -> None:
         """Register public teacher identifiers against their loaded model paths."""
@@ -217,10 +272,14 @@ class ModelResourceManager:
     def rollout_synchronized(self) -> int:
         if not self._rollout_enabled:
             raise ModelResourceManagerError("Cannot synchronize rollout weights when rollout is disabled")
+        self._rollout_started = True
         self.rollout_id = self.actor_id
         return self.rollout_id
 
-    def rollout_synchronization_failed(self) -> None:
+    def rollout_synchronization_failed(self, *, rollout_started: bool | None = None) -> None:
+        """The rollout holds unknown weights; ``rollout_started`` reports whether a lazy start had succeeded."""
+        if rollout_started is not None:
+            self._rollout_started = self._rollout_enabled and bool(rollout_started)
         self.rollout_id = None
 
     def state_saved(self, path: str) -> int:
@@ -370,19 +429,23 @@ class ModelResourceManager:
 
         if binding.actor_id is None:
             raise ModelResourceManagerError(f"Training sampling session {binding.sampler_id!r} has no actor ID")
-        if self._rollout_enabled and self.rollout_id == binding.actor_id:
+        if self._rollout_started and self.rollout_id == binding.actor_id:
             return SamplingResource.ROLLOUT
         if scalar_prompt_logprobs and self.actor_id == binding.actor_id:
             return SamplingResource.ACTOR
         if scalar_prompt_logprobs and binding.actor_id == 0 and self._reference_enabled:
             return SamplingResource.REFERENCE
+        if self.lazy_rollout_plan(binding) is not None:
+            # The caller starts the rollout (``lazy_rollout_plan``) before decoding.
+            return SamplingResource.ROLLOUT
 
         operation = "scalar prompt logprobs" if scalar_prompt_logprobs else "autoregressive sampling"
         raise StaleSamplerError(
             f"Sampling session {binding.sampler_id!r} is bound to actor ID {binding.actor_id}, "
             f"but {operation} cannot be served by the configured resources "
             f"(actor_id={self.actor_id}, rollout_id={self.rollout_id}, "
-            f"rollout_enabled={self._rollout_enabled}, reference_enabled={self._reference_enabled})"
+            f"rollout_enabled={self._rollout_enabled}, rollout_started={self._rollout_started}, "
+            f"reference_enabled={self._reference_enabled})"
         )
 
     def sampler_ids(self) -> list[str]:
@@ -396,9 +459,10 @@ class ModelResourceManager:
             or (
                 binding.actor_id is not None
                 and (
-                    (self._rollout_enabled and self.rollout_id == binding.actor_id)
+                    (self._rollout_started and self.rollout_id == binding.actor_id)
                     or self.actor_id == binding.actor_id
                     or (binding.actor_id == 0 and self._reference_enabled)
+                    or self.lazy_rollout_plan(binding) is not None
                 )
             )
         ]

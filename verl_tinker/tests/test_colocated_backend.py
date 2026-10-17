@@ -22,6 +22,7 @@ operations.
 import asyncio
 import logging
 import threading
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,8 +32,11 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 from verl_tinker.backends._loss import is_ref_in_actor
 from verl_tinker.backends.colocated import (
+    ROLLOUT_ENGINE_START_FAILED,
     ColocatedBackend,
     NoRolloutWorker,
+    RolloutStartError,
+    RolloutState,
     TinkerServerActorRolloutRefWorker,
 )
 from verl_tinker.backends.model_lifecycle import ModelLifecycle, ModelRole
@@ -238,6 +242,9 @@ def _make_backend(config):
     backend._resource_pool = None
     backend._replica_wake_lock = asyncio.Lock()
     backend._profile_step = 0
+    backend._lazy_rollout = False
+    backend._rollout_state = RolloutState.DISABLED if backend._no_rollout_deployment else RolloutState.READY
+    backend._rollout_start_error = None
     return backend
 
 
@@ -1102,3 +1109,145 @@ def test_bucketed_sender_direct_send_is_patched():
     from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
 
     assert getattr(BucketedWeightSender._direct_send_large_weight, "_envloop_device_patch", False)
+
+
+# ==================== Lazy rollout start (EnvLoop) ====================
+
+
+def _patched_init(stack, call_order):
+    for patcher in (
+        patch.object(ColocatedBackend, "_build_role_cls", return_value=({}, "actor")),
+        patch.object(ColocatedBackend, "_spawn_worker_groups", return_value={}),
+        patch.object(ColocatedBackend, "_init_worker_groups"),
+        patch.object(
+            ColocatedBackend, "_prepare_model_roles", side_effect=lambda *_a, **_k: call_order.append("offload")
+        ),
+        patch.object(ColocatedBackend, "_init_rollout_replicas", side_effect=lambda: call_order.append("init_rollout")),
+        patch(f"{_BACKEND_MODULE}.needs_reference_policy", return_value=False),
+        patch(f"{_BACKEND_MODULE}.is_ref_in_actor", return_value=True),
+    ):
+        stack.enter_context(patcher)
+
+
+def _lazy_backend(load_format="dummy"):
+    config = _make_config()
+    config.server.rollout_start = "lazy"
+    config.actor_rollout_ref.rollout.load_format = load_format
+    backend = _make_backend(config)
+    backend._lazy_rollout = True
+    backend._rollout_state = RolloutState.NOT_STARTED
+    return backend
+
+
+@pytest.mark.parametrize(("rollout_start", "expected"), [("lazy", []), ("eager", ["offload", "init_rollout"])])
+def test_lazy_server_init_does_not_start_the_rollout(rollout_start, expected):
+    config = _make_config()
+    config.server.rollout_start = rollout_start
+    call_order = []
+
+    with ExitStack() as stack:
+        _patched_init(stack, call_order)
+        backend = ColocatedBackend(config)
+
+    assert call_order == expected
+    assert backend.rollout_state is (RolloutState.NOT_STARTED if rollout_start == "lazy" else RolloutState.READY)
+
+
+def test_start_rollout_runs_the_eager_init_once():
+    backend = _lazy_backend()
+    call_order = []
+
+    with (
+        patch.object(
+            backend, "_prepare_model_roles", side_effect=lambda roles, **_: call_order.append(("roles", roles))
+        ),
+        patch.object(backend, "_init_rollout_replicas", side_effect=lambda: call_order.append("init_rollout")),
+    ):
+        assert backend.start_rollout(sync_weights=False, reason="test") is True
+        assert backend.start_rollout(sync_weights=False, reason="test") is False
+
+    # Same order as an eager server: offload every role, then launch, warm and sleep vLLM.
+    assert call_order == [("roles", set()), "init_rollout"]
+    assert backend.rollout_state is RolloutState.READY
+    backend.checkpoint_manager.update_weights.assert_not_called()
+
+
+def test_start_rollout_with_sync_pushes_the_actor_weights_after_init():
+    backend = _lazy_backend()
+    call_order = []
+    backend.checkpoint_manager.update_weights.side_effect = lambda: call_order.append("sync")
+
+    with (
+        patch.object(backend, "_prepare_model_roles"),
+        patch.object(backend, "_init_rollout_replicas", side_effect=lambda: call_order.append("init_rollout")),
+    ):
+        backend.start_rollout(sync_weights=True, reason="test")
+
+    assert call_order == ["init_rollout", "sync"]
+    backend.actor_rollout_wg.prepare_actor_for_weight_sync.assert_called_once()
+    assert backend._lifecycle.awake_roles == {ModelRole.ROLLOUT}
+
+
+def test_update_weights_starts_a_lazy_rollout_first():
+    backend = _lazy_backend()
+    call_order = []
+    backend.checkpoint_manager.update_weights.side_effect = lambda: call_order.append("sync")
+
+    with (
+        patch.object(backend, "_prepare_model_roles"),
+        patch.object(backend, "_init_rollout_replicas", side_effect=lambda: call_order.append("init_rollout")),
+    ):
+        backend.update_weights()
+        backend.update_weights()
+
+    assert call_order == ["init_rollout", "sync", "sync"]
+
+
+@pytest.mark.asyncio
+async def test_failed_rollout_start_is_typed_and_never_retried():
+    backend = _lazy_backend()
+    init = MagicMock(side_effect=RuntimeError("EngineCore failed to start."))
+
+    with patch.object(backend, "_prepare_model_roles"), patch.object(backend, "_init_rollout_replicas", init):
+        with pytest.raises(RolloutStartError, match=ROLLOUT_ENGINE_START_FAILED) as first:
+            backend.start_rollout(sync_weights=True, reason="test")
+        with pytest.raises(RolloutStartError, match="EngineCore failed to start"):
+            backend.update_weights()
+        with pytest.raises(RolloutStartError, match=ROLLOUT_ENGINE_START_FAILED):
+            await backend.generate("rid", [1, 2], {})
+
+    assert first.value.code == ROLLOUT_ENGINE_START_FAILED
+    assert init.call_count == 1
+    assert backend.rollout_state is RolloutState.FAILED
+    assert "EngineCore failed to start" in backend.rollout_start_error
+    backend.checkpoint_manager.update_weights.assert_not_called()
+
+
+def test_training_never_starts_a_lazy_rollout():
+    backend = _lazy_backend()
+    backend.actor_rollout_wg.forward_backward.return_value = "fb"
+
+    with patch.object(backend, "_init_rollout_replicas") as init:
+        backend.forward_backward(MagicMock())
+        backend.optim_step()
+        backend.save_checkpoint("/tmp/ckpt")
+
+    init.assert_not_called()
+    assert backend.rollout_state is RolloutState.NOT_STARTED
+
+
+@pytest.mark.parametrize(
+    ("load_format", "lora", "expected"),
+    [
+        ("dummy", {"lora_rank": 8}, False),
+        ("safetensors", {"lora_rank": 8}, True),
+        ("auto", {"lora": {"rank": 8}}, True),
+        # Full weights (or merged LoRA) sleep at level 2, which discards what vLLM loaded.
+        ("safetensors", {}, False),
+        ("safetensors", {"lora": {"rank": 8, "merge": True}}, False),
+    ],
+)
+def test_rollout_loads_base_weights_only_when_vllm_keeps_them(load_format, lora, expected):
+    backend = _lazy_backend(load_format)
+    backend.config.actor_rollout_ref.model.update(lora)
+    assert backend.rollout_loads_base_weights is expected

@@ -27,7 +27,9 @@ serialization lock for synchronous training and checkpoint operations.
 import asyncio
 import logging
 import threading
+import time
 from copy import deepcopy
+from enum import Enum
 from typing import Any, Optional
 
 import ray
@@ -53,6 +55,24 @@ from ._loss import is_ref_in_actor, make_branching_loss
 from .model_lifecycle import ModelLifecycle, ModelRole
 
 logger = logging.getLogger("ray")
+
+# Error code of a sampler request whose rollout engine could not be started (EnvLoop).
+ROLLOUT_ENGINE_START_FAILED = "ROLLOUT_ENGINE_START_FAILED"
+
+
+class RolloutState(str, Enum):
+    """Whether the rollout replicas exist (``server.rollout_start``)."""
+
+    DISABLED = "disabled"  # no-rollout deployment
+    NOT_STARTED = "not_started"  # lazy: nothing has needed the sampler yet
+    READY = "ready"
+    FAILED = "failed"
+
+
+class RolloutStartError(RuntimeError):
+    """The rollout replicas failed to start; later sampler requests fail fast with the same error."""
+
+    code = ROLLOUT_ENGINE_START_FAILED
 
 
 def effective_clip_grad(grad_clip_norm: Optional[float]) -> Optional[float]:
@@ -286,6 +306,10 @@ class ColocatedBackend:
     3. _init_worker_groups()      — init actor/rollout, ref
     4. _init_rollout_replicas()   — vLLM replicas, checkpoint manager
 
+    With ``server.rollout_start: lazy`` (EnvLoop) step 4 is deferred until the
+    first request that needs the sampler (``start_rollout``, or ``update_weights``),
+    so a session that only trains never loads a second model copy.
+
     After initialization, provides operation methods (generate,
     compute_log_prob, forward_backward, optim_step, etc.) that route to the appropriate
     worker group or replica.
@@ -318,6 +342,9 @@ class ColocatedBackend:
         self._lifecycle: ModelLifecycle | None = None
         self._replica_wake_lock = asyncio.Lock()
         self._profile_step = 0
+        self._lazy_rollout = config.get("server", {}).get("rollout_start", "eager") == "lazy"
+        self._rollout_state = RolloutState.DISABLED if self._no_rollout_deployment else RolloutState.NOT_STARTED
+        self._rollout_start_error: str | None = None
 
         # Ray workers import model.external_lib through HFModelConfig, but rollout
         # registries are process-local, so the backend must import them before
@@ -335,11 +362,14 @@ class ColocatedBackend:
             has_ref=bool(self.ref_policy_wg is not None and not self._ref_in_actor),
             actor_awake=True,
         )
-        if not self._no_rollout_deployment:
+        if self._no_rollout_deployment:
+            logger.info("No-rollout deployment: skipping rollout replica initialization")
+        elif self._lazy_rollout:
+            logger.info("Lazy rollout: replicas start on the first request that needs the sampler")
+        else:
             self._prepare_model_roles(set(), reason="before rollout init")
             self._init_rollout_replicas()
-        else:
-            logger.info("No-rollout deployment: skipping rollout replica initialization")
+            self._rollout_state = RolloutState.READY
 
     # ==================== Backend protocol — properties ====================
 
@@ -364,6 +394,25 @@ class ColocatedBackend:
     @property
     def server_manager(self):
         return self._server_manager
+
+    @property
+    def rollout_state(self) -> RolloutState:
+        return self._rollout_state
+
+    @property
+    def rollout_start_error(self) -> str | None:
+        return self._rollout_start_error
+
+    @property
+    def rollout_loads_base_weights(self) -> bool:
+        """A started rollout holds the base model before any sync: vLLM read it from disk (not ``dummy``)
+        and the warm-up sleep kept it, which VeRL does only for LoRA adapters (sleep level 1; full weights
+        sleep at level 2 and are discarded)."""
+        model = self.config.actor_rollout_ref.model
+        lora = model.get("lora", None) or {}
+        lora_rank = int(lora.get("rank", 0) or 0) or int(model.get("lora_rank", 0) or 0)
+        lora_as_adapter = lora_rank > 0 and not lora.get("merge", False)
+        return lora_as_adapter and "dummy" not in str(self.config.actor_rollout_ref.rollout.get("load_format", "dummy"))
 
     # ==================== Worker init ====================
 
@@ -605,6 +654,43 @@ class ColocatedBackend:
             self._lifecycle.mark_asleep(ModelRole.ROLLOUT)
         logger.info("[engine] post-init transition: warmup + sleep done")
 
+    def start_rollout(self, *, sync_weights: bool, reason: str) -> bool:
+        """Start the rollout replicas if they are not running yet (``server.rollout_start: lazy``).
+
+        Runs the same init as an eager server (actor offloaded, replicas launched,
+        warmed and slept), then, with ``sync_weights``, pushes the actor's current
+        weights. Returns True when this call started the rollout. A failed start is
+        not retried: this and later calls raise ``RolloutStartError``.
+        """
+        with self._engine_lock:
+            started = self._start_rollout_locked(reason=reason)
+            if sync_weights:
+                self._update_weights_locked()
+            return started
+
+    def _start_rollout_locked(self, *, reason: str) -> bool:
+        if self._rollout_state is RolloutState.READY:
+            return False
+        if self._rollout_state is RolloutState.DISABLED:
+            raise RuntimeError("The rollout is not available in no_rollout_deployment mode")
+        if self._rollout_state is RolloutState.FAILED:
+            raise RolloutStartError(self._rollout_start_error)
+        logger.info("[engine] starting rollout replicas: %s", reason)
+        started_at = time.monotonic()
+        try:
+            self._prepare_model_roles(set(), reason="before rollout init")
+            self._init_rollout_replicas()
+        except Exception as exc:
+            self._rollout_state = RolloutState.FAILED
+            self._rollout_start_error = (
+                f"{ROLLOUT_ENGINE_START_FAILED}: the sampling engine failed to start ({type(exc).__name__}: {exc})"
+            )
+            logger.exception("[engine] rollout start failed")
+            raise RolloutStartError(self._rollout_start_error) from exc
+        self._rollout_state = RolloutState.READY
+        logger.info("[engine] rollout replicas started in %.1fs", time.monotonic() - started_at)
+        return True
+
     def _is_vexact_rollout(self) -> bool:
         """vexact's VeXactServer.generate hard-rejects ``max_tokens`` /
         ``max_new_tokens`` in ``sampling_params`` (see open-vexact
@@ -744,6 +830,8 @@ class ColocatedBackend:
         video_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
         """Dispatch a single generation request to a rollout replica (least-requests)."""
+        if self._rollout_state is RolloutState.FAILED:
+            raise RolloutStartError(self._rollout_start_error)
         if self._server_manager is None:
             raise RuntimeError("No rollout replicas available")
 
@@ -824,20 +912,25 @@ class ColocatedBackend:
         that sequence while keeping actor parameters and gradients resident.
 
         Raises RuntimeError in no_rollout_deployment mode (no rollout replicas to sync).
+        A lazy rollout that has not started yet is started first.
         """
         with self._engine_lock:
             if self._no_rollout_deployment:
                 raise RuntimeError("update_weights is not available in no_rollout_deployment mode")
-            self._prepare_model_roles({ModelRole.ACTOR}, reason="update_weights")
-            if self._enable_offload:
-                logger.info("[engine] offloading actor optimizer before rollout weight sync")
-                self.actor_rollout_wg.prepare_actor_for_weight_sync()
-            self.checkpoint_manager.update_weights()
-            if self._enable_offload:
-                self._move_actor("cpu", reason="after update_weights")
-                if self._lifecycle is not None:
-                    self._lifecycle.mark_asleep(ModelRole.ACTOR)
-                    self._lifecycle.mark_awake(ModelRole.ROLLOUT)
+            self._start_rollout_locked(reason="update_weights")
+            self._update_weights_locked()
+
+    def _update_weights_locked(self):
+        self._prepare_model_roles({ModelRole.ACTOR}, reason="update_weights")
+        if self._enable_offload:
+            logger.info("[engine] offloading actor optimizer before rollout weight sync")
+            self.actor_rollout_wg.prepare_actor_for_weight_sync()
+        self.checkpoint_manager.update_weights()
+        if self._enable_offload:
+            self._move_actor("cpu", reason="after update_weights")
+            if self._lifecycle is not None:
+                self._lifecycle.mark_asleep(ModelRole.ACTOR)
+                self._lifecycle.mark_awake(ModelRole.ROLLOUT)
 
     def save_checkpoint(self, local_path: str, global_step: int = 0, max_ckpt_to_keep=None, **kwargs):
         with self._engine_lock:

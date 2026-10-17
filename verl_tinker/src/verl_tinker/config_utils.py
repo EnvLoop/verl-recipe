@@ -42,8 +42,12 @@ DEFAULT_SERVER_CONFIG = {
     "server_max_runtime": None,
     "max_concurrent_samples": 32,
     "enable_offload": True,
+    # "eager" starts the rollout replicas with the server; "lazy" (EnvLoop) starts
+    # them on the first request that needs the sampler (``ColocatedBackend.start_rollout``).
+    "rollout_start": "eager",
     "auto_merge_verl_default_config": True,
 }
+ROLLOUT_START_MODES = ("eager", "lazy")
 _VERL_OFFLOAD_FALSE_PATHS = (
     "actor_rollout_ref.actor.fsdp_config.param_offload",
     "actor_rollout_ref.actor.fsdp_config.optimizer_offload",
@@ -375,6 +379,10 @@ def _validate_config(config) -> list[str]:
 
     if bool(config.get("critic", {}).get("enable", False)):
         errors.append("critic support has been removed from the Tinker server; set critic.enable=false")
+
+    rollout_start = _select(config, "server.rollout_start")
+    if not _is_missing(rollout_start) and rollout_start not in ROLLOUT_START_MODES:
+        errors.append(f"server.rollout_start must be one of {list(ROLLOUT_START_MODES)}, got {rollout_start!r}")
 
     if bool(config.get("actor_rollout_ref", {}).get("actor", {}).get("use_kl_loss", False)):
         errors.append(

@@ -39,10 +39,11 @@ from tinker.types import (
     SaveWeightsForSamplerRequest,
 )
 
-from .backends.colocated import ColocatedBackend
+from .backends.colocated import ColocatedBackend, RolloutState
 from .backends.teacher import TeacherInferenceBackend
 from .lora_info import LoraInfo, configured_lora_info
 from .model_resource_manager import (
+    LazyRolloutPlan,
     ModelResourceManager,
     ModelResourceManagerError,
     SamplingResource,
@@ -230,6 +231,8 @@ class TinkerServer:
         self._op_gate = FifoReadWriteGate(
             max_readers=config["server"].get("max_concurrent_samples", 16),
         )
+        # Serializes a lazy rollout start and its bookkeeping across concurrent samples.
+        self._rollout_start_lock = asyncio.Lock()
 
         self._futures: dict[str, dict[str, Any]] = {}
         self._pending: dict[str, asyncio.Task] = {}
@@ -478,10 +481,14 @@ class TinkerServer:
         if not named:
             session_id = self._model_resource_manager.session_id_for_model(str(req.model_id))
 
+        engine = self._get_engine()
         try:
-            result = await tinker_save_weights_for_sampler(self._get_engine(), named=named)
+            # A lazy rollout starts here (``ColocatedBackend.update_weights``) inside this request's future.
+            result = await tinker_save_weights_for_sampler(engine, named=named)
         except BaseException:
-            self._model_resource_manager.rollout_synchronization_failed()
+            self._model_resource_manager.rollout_synchronization_failed(
+                rollout_started=engine.rollout_state is RolloutState.READY,
+            )
             raise
 
         rollout_id = self._model_resource_manager.rollout_synchronized()
@@ -499,12 +506,38 @@ class TinkerServer:
         result["sampling_session_id"] = sampler_id
         return result
 
+    async def _start_lazy_rollout(self, binding) -> None:
+        """Start a lazy rollout so it holds ``binding``'s weights (``None``: any weights).
+
+        Runs inside the request's scheduled future, so the client polls with
+        ``try_again`` while vLLM starts. Concurrent samples wait on the start lock and
+        then re-resolve against the started rollout.
+        """
+        async with self._rollout_start_lock:
+            manager = self._model_resource_manager
+            plan = manager.lazy_rollout_plan(binding)
+            if plan is None:
+                return
+            engine = self._get_engine()
+            try:
+                await asyncio.to_thread(
+                    engine.start_rollout,
+                    sync_weights=plan is LazyRolloutPlan.SYNC,
+                    reason=f"sampler {getattr(binding, 'sampler_id', None) or 'request'} ({plan.value})",
+                )
+            except BaseException:
+                manager.rollout_synchronization_failed(rollout_started=engine.rollout_state is RolloutState.READY)
+                raise
+            manager.rollout_started(plan)
+
     def _init_engine(self):
         try:
             self._engine = ColocatedBackend(self.config)
             self._model_resource_manager.configure_resources(
                 rollout_enabled=not self._engine.no_rollout_deployment,
                 reference_enabled=self._engine.capabilities.use_reference_policy,
+                rollout_started=self._engine.rollout_state is RolloutState.READY,
+                rollout_loads_base_weights=self._engine.rollout_loads_base_weights,
             )
             if TeacherInferenceBackend.is_enabled(self.config):
                 self._teacher_backend = TeacherInferenceBackend(self.config)
@@ -591,7 +624,14 @@ class TinkerServer:
     async def healthz(self) -> dict[str, str]:
         """Compatibility health endpoint for existing launch helpers."""
         if self._status == ServerStatus.INITIALIZED:
-            return {"status": "ready"}
+            engine = getattr(self, "_engine", None)
+            if engine is None:
+                return {"status": "ready"}
+            # A lazy rollout can start (or fail to start) long after the server is ready.
+            health = {"status": "ready", "rollout": engine.rollout_state.value}
+            if engine.rollout_start_error:
+                health["rollout_error"] = engine.rollout_start_error
+            return health
         if self._status == ServerStatus.ERROR:
             return {"status": self._status.value, "message": self._error or ""}
         return {"status": self._status.value}
@@ -838,14 +878,20 @@ class TinkerServer:
             and int(getattr(req, "topk_sample_logprobs", 0) or 0) == 0
         )
 
-        async def _sample_with_late_binding():
+        def _resolve():
             try:
-                resource = self._model_resource_manager.resolve_resource(
+                return self._model_resource_manager.resolve_resource(
                     binding,
                     scalar_prompt_logprobs=scalar_prompt_logprobs,
                 )
             except StaleSamplerError as exc:
                 raise HTTPException(HTTPStatus.CONFLICT, str(exc)) from exc
+
+        async def _sample_with_late_binding():
+            resource = _resolve()
+            if resource is SamplingResource.ROLLOUT and self._model_resource_manager.rollout_pending:
+                await self._start_lazy_rollout(binding)
+                resource = _resolve()
 
             if resource is SamplingResource.TEACHER:
                 if self._teacher_backend is None or binding.teacher_model_path is None:
