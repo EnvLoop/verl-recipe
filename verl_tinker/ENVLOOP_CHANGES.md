@@ -12,6 +12,28 @@ EnvLoop gateway).
 
 ## Behaviour changes
 
+### External-format save extension (2026-10-19)
+
+The optional `server.external_weights_handler` supports Tinker's
+`save_weights_external` route without changing the actor or rollout engine.
+It runs under the existing exclusive FIFO; retries of a model/sequence return
+the same future and conflicting payloads return 409. Its completed result is
+retained separately from the generic recent-future LRU. No configured handler
+means an explicit unsupported response and no GPU side effect.
+
+The EnvPlatform handler freezes an ordinary actor checkpoint privately, converts
+its LoRA tensors to portable PEFT, and optionally encrypts the external files.
+It does not expose optimizer shards as an external export, update model weights,
+or start/synchronize vLLM. The handler and its GPU deployment are maintained in
+EnvPlatform; their integration must be verified independently of this route.
+
+Local CPU validation runs the exact router methods and FIFO extracted from this
+source with only the GPU/callback boundary substituted, plus the existing model
+resource-manager suite. It verifies optimizer → export → optimizer ordering,
+no duplicate snapshot on retries, conflicting payloads, model ownership,
+unsupported configuration, failure retention and result retrieval after generic
+LRU eviction. These tests do not claim a Ray Serve deployment or real GPU export.
+
 ### 1. `gspo` loss (new)
 
 * Accepted everywhere RL losses are accepted: wire schema literal

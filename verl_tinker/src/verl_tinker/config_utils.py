@@ -46,6 +46,9 @@ DEFAULT_SERVER_CONFIG = {
     # them on the first request that needs the sampler (``ColocatedBackend.start_rollout``).
     "rollout_start": "eager",
     "auto_merge_verl_default_config": True,
+    # Optional trusted deployment callback(engine, config, checkpoint_root, request).
+    # Absent: the external export endpoint fails explicitly without GPU work.
+    "external_weights_handler": None,
 }
 ROLLOUT_START_MODES = ("eager", "lazy")
 _VERL_OFFLOAD_FALSE_PATHS = (
