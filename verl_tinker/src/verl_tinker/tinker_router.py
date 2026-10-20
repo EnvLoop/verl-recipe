@@ -42,6 +42,7 @@ from tinker.types import (
 from .backends.colocated import ColocatedBackend, RolloutState
 from .backends.teacher import TeacherInferenceBackend
 from .capabilities import runtime_capabilities
+from .external_weights import retained_external_result, submit_external_weights
 from .lora_info import LoraInfo, configured_lora_info
 from .model_resource_manager import (
     LazyRolloutPlan,
@@ -908,6 +909,10 @@ class TinkerServer:
         self._schedule(request_id, self._run_save_state(req))
         return self._future_envelope(request_id, model_id=req.get("model_id"))
 
+    @app.post("/api/v1/save_weights_external")
+    async def save_weights_external(self, req: dict):
+        return await submit_external_weights(self, req)
+
     @app.post("/api/v1/load_weights")
     async def load_weights(self, req: dict):
         self._require_ready()
@@ -1007,6 +1012,12 @@ class TinkerServer:
     async def retrieve_future(self, req: FutureRetrieveRequest):
         self._require_ready()
         request_id = req.request_id
+        external = retained_external_result(self, request_id)
+        if external is not None:
+            self._futures.pop(request_id, None)
+            self._errors.pop(request_id, None)
+            self._request_status[request_id] = RequestStatus.RETRIEVED
+            return external
         task = self._pending.get(request_id)
         if task is not None:
             try:

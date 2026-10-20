@@ -97,6 +97,29 @@ dependencies are resolved together. Use `--show` to inspect it first:
 
 ## Choose a config
 
+### Optional external adapter export
+
+`POST /api/v1/save_weights_external` accepts the Tinker external-save request and
+uses the same exclusive FIFO as optimizer, forward/backward and checkpoint
+operations. It requires a trusted deployment callback configured as
+`server.external_weights_handler` (a dotted Python callable). Without one, the
+endpoint returns `EXTERNAL_WEIGHTS_UNSUPPORTED` before scheduling work.
+
+The callback receives `(engine, config, checkpoint_root, request)` and must return
+`{"type": "save_weights_external", "path": "tinker://.../external_weights/..."}`
+only after creating an immutable external-format snapshot. The deployment owns
+portable adapter conversion, optional age encryption, durable publication and
+access control. The callback must not apply an optimizer step, restore another
+model, or use live weights after releasing the snapshot barrier. An ordinary
+training checkpoint with optimizer state is not an external-format export.
+
+Repeated requests with the same model/sequence and body share one future;
+conflicting bodies are rejected. Completed export results remain retrievable
+after the generic recent-future cache evicts older results. The callback runs in
+a worker thread while holding the FIFO's exclusive gate, so readiness and future
+polling remain responsive. This extension does not change dependency pins or
+enable a handler in existing deployments.
+
 Quick-start configs are under `verl_tinker/configs/quick_start/`.
 
 | Config | Workers | Use it for |
